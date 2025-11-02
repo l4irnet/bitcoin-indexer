@@ -30,10 +30,7 @@ use itertools::Itertools;
 
 /// shorter `postgres` crate import names to just `pg::X`
 mod pg {
-    pub use postgres::{
-        row::Row, tls::TlsConnect, types::BorrowToSql, types::ToSql, Client, GenericClient,
-        RowIter, Transaction,
-    };
+    pub use postgres::{types::ToSql, Client, GenericClient, Transaction};
     // pub type Result<T> = std::result::Result<T, postgres::error::Error>;
 }
 
@@ -406,7 +403,7 @@ impl<'a> TxFormatter<'a> {
 
             s.write_str("'::bytea,'\\x").unwrap();
             write_hash_rest_hex(s, &tx_id).unwrap();
-            let weight = tx.get_weight();
+            let weight = tx.weight();
 
             s.write_fmt(format_args!(
                 "'::bytea,{},{},{},{},{}",

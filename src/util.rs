@@ -37,7 +37,7 @@ impl BottleCheck {
         res
     }
 
-    pub fn check_iter<I>(&mut self, iter: I) -> BottleCheckIter<I>
+    pub fn check_iter<I>(&mut self, iter: I) -> BottleCheckIter<'_, I>
     where
         I: Iterator,
     {

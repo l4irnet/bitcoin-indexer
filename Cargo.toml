@@ -17,13 +17,13 @@ harness = false
 name = "bitcoincore_rpc"
 
 [dependencies]
-bitcoin = "0.26"
-bitcoincore-rpc = "0.13"
+bitcoin = "0.28"
+bitcoincore-rpc = "0.15"
 common_failures = "*"
 diesel = { version = "1.4", optional = true }
 failure = "*"
 hex = "0.4"
-secp256k1 = "0.20"
+secp256k1 = "0.22"
 crossbeam-channel = "*"
 structopt = "*"
 default = "*"
@@ -36,7 +36,7 @@ rayon = "1"
 env_logger = { version = "*", default-features = false, features = ["termcolor", "atty", "humantime"]}
 itertools = "0.8"
 url = "2"
-fallible-iterator = "*"
+fallible-iterator = "0.2"
 
 [dev-dependencies]
 criterion = "0.2"

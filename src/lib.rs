@@ -65,10 +65,7 @@ impl RpcInfo {
         })
     }
     pub fn to_rpc_client(&self) -> Result<bitcoincore_rpc::Client> {
-        Ok(bitcoincore_rpc::Client::new(
-            self.url.clone(),
-            self.auth.clone(),
-        )?)
+        Ok(bitcoincore_rpc::Client::new(&self.url, self.auth.clone())?)
     }
 }
 #[cfg(test)]
