@@ -19,7 +19,7 @@
 //! Indexer guarantees that reorgs are atomic - one will never observe chain shrinking / in the middle of a reorg.
 //! We heavily rely on transactions.
 //!
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 
 use super::*;
 use crate::{BlockHash, BlockHeight};
@@ -79,6 +79,66 @@ pub fn establish_connection(url: &str) -> pg::Client {
     let cert = std::env::var("PGSSLCERT").ok();
     let key = std::env::var("PGSSLKEY").ok();
 
+    // Basic URL diagnostics
+    match url::Url::parse(url) {
+        Ok(u) => {
+            info!(
+                "PG connect target: scheme={} host={:?} port={:?} db={} user={}",
+                u.scheme(),
+                u.host_str(),
+                u.port_or_known_default(),
+                u.path().trim_start_matches('/'),
+                u.username()
+            );
+        }
+        Err(e) => {
+            warn!("PG connect target: failed to parse URL: {}", e);
+        }
+    }
+
+    // TLS env diagnostics
+    debug!(
+        "TLS env: PGSSLROOTCERT={} PGSSLCERT={} PGSSLKEY={}",
+        ca.as_deref().unwrap_or(""),
+        cert.as_deref().unwrap_or(""),
+        key.as_deref().unwrap_or("")
+    );
+
+    // TLS file diagnostics (paths, readability) and client cert subject
+    #[cfg(feature = "pg_tls_openssl")]
+    {
+        if let Some(ref p) = ca {
+            match std::fs::canonicalize(p) {
+                Ok(abs) => debug!("PGSSLROOTCERT path: {}", abs.display()),
+                Err(e) => debug!("PGSSLROOTCERT path: {} (err: {})", p, e),
+            }
+        }
+        if let Some(ref p) = cert {
+            match std::fs::canonicalize(p) {
+                Ok(abs) => debug!("PGSSLCERT path: {}", abs.display()),
+                Err(e) => debug!("PGSSLCERT path: {} (err: {})", p, e),
+            }
+            // Try to print client certificate subject CN
+            if let Ok(pem) = std::fs::read(p) {
+                if let Ok(x509) = openssl::x509::X509::from_pem(&pem) {
+                    use openssl::nid::Nid;
+                    if let Some(entry) = x509.subject_name().entries_by_nid(Nid::COMMONNAME).next()
+                    {
+                        if let Ok(val) = entry.data().as_utf8() {
+                            debug!("Client cert subject CN={}", val);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ref p) = key {
+            match std::fs::canonicalize(p) {
+                Ok(abs) => debug!("PGSSLKEY path: {}", abs.display()),
+                Err(e) => debug!("PGSSLKEY path: {} (err: {})", p, e),
+            }
+        }
+    }
+
     // If TLS material is present and the feature is enabled, use OpenSSL mTLS.
     #[cfg(feature = "pg_tls_openssl")]
     {
@@ -99,7 +159,15 @@ pub fn establish_connection(url: &str) -> pg::Client {
             loop {
                 match pg::Client::connect(url, tls.clone()) {
                     Err(e) => {
-                        eprintln!("Error connecting to PG (TLS): {}", e);
+                        // Print error with source chain for better diagnostics
+                        let mut msg = format!("{}", e);
+                        let mut src = (&e as &dyn std::error::Error).source();
+                        while let Some(c) = src {
+                            msg.push_str("; caused by: ");
+                            msg.push_str(&c.to_string());
+                            src = c.source();
+                        }
+                        warn!("Error connecting to PG (TLS): {}", msg);
                         std::thread::sleep(std::time::Duration::from_secs(1));
                     }
                     Ok(o) => return o,
@@ -122,7 +190,15 @@ pub fn establish_connection(url: &str) -> pg::Client {
     loop {
         match pg::Client::connect(url, postgres::tls::NoTls) {
             Err(e) => {
-                eprintln!("Error connecting to PG: {}", e);
+                // Print error with source chain for better diagnostics
+                let mut msg = format!("{}", e);
+                let mut src = (&e as &dyn std::error::Error).source();
+                while let Some(c) = src {
+                    msg.push_str("; caused by: ");
+                    msg.push_str(&c.to_string());
+                    src = c.source();
+                }
+                warn!("Error connecting to PG: {}", msg);
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
             Ok(o) => return o,
