@@ -18,7 +18,7 @@ name = "bitcoincore_rpc"
 
 [dependencies]
 bitcoin = "0.28"
-bitcoincore-rpc = "0.15"
+bitcoincore-rpc = "0.19.0"
 common_failures = "*"
 diesel = { version = "1.4", optional = true }
 failure = "*"
@@ -37,6 +37,7 @@ env_logger = { version = "*", default-features = false, features = ["termcolor",
 itertools = "0.8"
 url = "2"
 fallible-iterator = "0.2"
+
 openssl = "0.10"
 postgres-openssl = "0.5"
 

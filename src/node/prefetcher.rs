@@ -12,6 +12,9 @@ use std::{
     time::Duration,
 };
 
+use bitcoin::consensus::encode::deserialize;
+use std::str::FromStr;
+
 fn retry<T>(mut f: impl FnMut() -> Result<T>) -> T {
     let delay_ms = 100;
     let mut count = 0;
@@ -50,12 +53,18 @@ impl Rpc for bitcoincore_rpc::Client {
                     Err(e.into())
                 }
             }
-            Ok(o) => Ok(Some(o)),
+            Ok(h) => {
+                let hex = h.to_string();
+                let local = bitcoin::hash_types::BlockHash::from_str(&hex)?;
+                Ok(Some(local))
+            }
         }
     }
 
     fn get_block_by_id(&self, hash: &Self::Id) -> Result<Option<(Self::Data, Self::Id)>> {
-        let block: Box<bitcoin::Block> = match self.get_by_id(hash) {
+        let hex = hash.to_string();
+        let rpc_hash = bitcoincore_rpc::bitcoin::BlockHash::from_str(&hex)?;
+        let block_hex = match self.get_block_hex(&rpc_hash) {
             Err(e) => {
                 if e.to_string().contains("Block height out of range") {
                     return Ok(None);
@@ -63,10 +72,12 @@ impl Rpc for bitcoincore_rpc::Client {
                     return Err(e.into());
                 }
             }
-            Ok(o) => Box::new(o),
+            Ok(s) => s,
         };
+        let bytes = hex::decode(block_hex)?;
+        let block: bitcoin::Block = deserialize(&bytes)?;
         let prev_id = block.header.prev_blockhash;
-        Ok(Some((block, prev_id)))
+        Ok(Some((Box::new(block), prev_id)))
     }
 }
 
