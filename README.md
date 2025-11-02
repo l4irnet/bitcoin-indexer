@@ -100,6 +100,20 @@ DATABASE_URL=postgres://bitcoin-indexer:bitcoin-indexer@localhost/bitcoin-indexe
 NODE_RPC_URL=http://someuser:somepassword@localhost:18443
 ```
 
+#### Optional TLS/mTLS for Postgres
+
+If you prefer to connect over TLS with client certificates, set these optional environment variables in your `.env`:
+
+- `PGSSLROOTCERT` — absolute path to CA certificate (PEM)
+- `PGSSLCERT` — absolute path to client certificate (PEM)
+- `PGSSLKEY` — absolute path to client private key (PEM)
+
+Notes:
+- Paths must be absolute (tilde `~` is not expanded).
+- The host in `DATABASE_URL` should match the Postgres server certificate.
+- If using certificate-based auth, ensure your Postgres role mapping matches the client certificate subject/CN.
+- See `.env.example` for a minimal sample.
+
 #### Optimize DB performance for massive amount of inserts!
 
 **This one is very important!!!**

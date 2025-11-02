@@ -37,6 +37,12 @@ env_logger = { version = "*", default-features = false, features = ["termcolor",
 itertools = "0.8"
 url = "2"
 fallible-iterator = "0.2"
+openssl = "0.10"
+postgres-openssl = "0.5"
+
+[features]
+pg_tls_openssl = []
+default = ["pg_tls_openssl"]
 
 [dev-dependencies]
 criterion = "0.2"

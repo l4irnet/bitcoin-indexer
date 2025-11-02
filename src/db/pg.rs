@@ -63,8 +63,62 @@ impl<'a> GenericConnection for pg::Transaction<'a> {
 }
 */
 
-/// Estabilish connection with the DB
+/// Establish connection with the DB.
+/// If PGSSLROOTCERT, PGSSLCERT and PGSSLKEY are set and the binary is built with the
+/// 'pg_tls_openssl' feature (and corresponding dependencies), an OpenSSL TLS connector
+/// is used for mTLS. Otherwise, it falls back to a non-TLS connection.
+///
+/// Expected env:
+/// - DATABASE_URL: e.g. postgres://bitcoin-indexer@db.example.com:5432/bitcoin
+/// - PGSSLROOTCERT: /home/USER/.config/tls/example.com/cert/ca.example.com.pem
+/// - PGSSLCERT:     /home/USER/.config/tls/example.com/cert/client.example.com.pem
+/// - PGSSLKEY:      /home/USER/.config/tls/example.com/key/client.example.com.pem
 pub fn establish_connection(url: &str) -> pg::Client {
+    // Detect TLS configuration via environment variables.
+    let ca = std::env::var("PGSSLROOTCERT").ok();
+    let cert = std::env::var("PGSSLCERT").ok();
+    let key = std::env::var("PGSSLKEY").ok();
+
+    // If TLS material is present and the feature is enabled, use OpenSSL mTLS.
+    #[cfg(feature = "pg_tls_openssl")]
+    {
+        if let (Some(ca), Some(cert), Some(key)) = (ca.clone(), cert.clone(), key.clone()) {
+            let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())
+                .expect("Failed to initialize OpenSSL connector builder");
+            builder.set_ca_file(&ca).expect("Failed to load CA file");
+            builder
+                .set_certificate_chain_file(&cert)
+                .expect("Failed to load client certificate chain");
+            builder
+                .set_private_key_file(&key, openssl::ssl::SslFiletype::PEM)
+                .expect("Failed to load client private key");
+            builder.set_verify(openssl::ssl::SslVerifyMode::PEER);
+
+            let tls = postgres_openssl::MakeTlsConnector::new(builder.build());
+
+            loop {
+                match pg::Client::connect(url, tls.clone()) {
+                    Err(e) => {
+                        eprintln!("Error connecting to PG (TLS): {}", e);
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                    Ok(o) => return o,
+                }
+            }
+        }
+    }
+
+    // If TLS env vars are set but TLS feature is not enabled, warn and fall back.
+    #[cfg(not(feature = "pg_tls_openssl"))]
+    {
+        if ca.is_some() || cert.is_some() || key.is_some() {
+            eprintln!(
+                "PGSSL* env vars detected, but binary is built without 'pg_tls_openssl' feature; falling back to non-TLS"
+            );
+        }
+    }
+
+    // Fallback: non-TLS connection.
     loop {
         match pg::Client::connect(url, postgres::tls::NoTls) {
             Err(e) => {
