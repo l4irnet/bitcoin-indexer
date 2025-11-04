@@ -73,7 +73,7 @@ impl TestRpc {
             .map(|n| ReorgParams {
                 delay: n.0 % 8,
                 depth: n.1,
-                add: n.2 + 1,
+                add: n.2.saturating_add(1),
             })
             .collect();
 
@@ -86,7 +86,7 @@ impl TestRpc {
             next_block_data: 1337,
         };
 
-        for _ in 0..start.map(|n| n + 1).unwrap_or(0) {
+        for _ in 0..start.map(|n| n.saturating_add(1)).unwrap_or(0) {
             inner.mine_block();
         }
 

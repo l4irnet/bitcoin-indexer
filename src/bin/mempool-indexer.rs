@@ -1,5 +1,5 @@
 use bitcoin::consensus::encode::deserialize;
-use bitcoin::hashes::hex::FromHex;
+
 use bitcoin_indexer::{
     db::{self, MempoolStore},
     prelude::*,
@@ -63,7 +63,7 @@ fn run() -> Result<()> {
 
             trace!("Inserting mempool tx {}", txid_str);
 
-            let tx_id_local = match bitcoin_indexer::Txid::from_hex(&txid_str) {
+            let tx_id_local = match txid_str.parse::<bitcoin_indexer::Txid>() {
                 Ok(t) => t,
                 Err(_) => {
                     failed += 1;

@@ -218,9 +218,9 @@ fn calculate_tx_id_with_workarounds(
     tx: &bitcoin::blockdata::transaction::Transaction,
     network: bitcoin::Network,
 ) -> bitcoin::hash_types::Txid {
-    let is_coinbase = tx.is_coin_base();
+    let is_coinbase = tx.is_coinbase();
     if network != bitcoin::Network::Bitcoin {
-        tx.txid()
+        tx.compute_txid()
     } else if block.height == 91842 && is_coinbase {
         // d5d27987d2a3dfc724e359870c6644b40e497bdc0589a033220fe15429d88599
         // e3bf3d07d4b0375638d5f1db5255fe07ba2c4cb067cd81b84ee974b6585fb469
@@ -230,32 +230,28 @@ fn calculate_tx_id_with_workarounds(
         // https://blockchair.com/bitcoin/block/91842
         // to make the unique indexes happy, we just add one to last byte
 
-        Txid::from_hex("d5d27987d2a3dfc724e359870c6644b40e497bdc0589a033220fe15429d885a0").unwrap()
+        "d5d27987d2a3dfc724e359870c6644b40e497bdc0589a033220fe15429d885a0"
+            .parse::<Txid>()
+            .unwrap()
     } else if block.height == 91880 && is_coinbase {
-        Txid::from_hex("e3bf3d07d4b0375638d5f1db5255fe07ba2c4cb067cd81b84ee974b6585fb469").unwrap()
+        "e3bf3d07d4b0375638d5f1db5255fe07ba2c4cb067cd81b84ee974b6585fb469"
+            .parse::<Txid>()
+            .unwrap()
     } else {
-        tx.txid()
+        tx.compute_txid()
     }
 }
 
 fn write_hash_id_hex<W: std::fmt::Write>(w: &mut W, hash: &Sha256dHash) -> std::fmt::Result {
-    w.write_str(
-        &hash.as_inner()[..SQL_HASH_ID_SIZE]
-            .to_owned()
-            .encode_hex::<String>(),
-    )
+    w.write_str(&hex::encode(&hash.as_byte_array()[..SQL_HASH_ID_SIZE]))
 }
 
 fn write_hash_rest_hex<W: std::fmt::Write>(w: &mut W, hash: &Sha256dHash) -> std::fmt::Result {
-    w.write_str(
-        &hash.as_inner()[SQL_HASH_ID_SIZE..]
-            .to_owned()
-            .encode_hex::<String>(),
-    )
+    w.write_str(&hex::encode(&hash.as_byte_array()[SQL_HASH_ID_SIZE..]))
 }
 
 fn write_hash_hex<W: std::fmt::Write>(w: &mut W, hash: &Sha256dHash) -> std::fmt::Result {
-    w.write_str(&hash.into_inner().encode_hex::<String>())
+    w.write_str(&hex::encode(&hash.as_byte_array()[..]))
 }
 
 fn write_hex<W: std::fmt::Write>(w: &mut W, hash: &[u8]) -> std::fmt::Result {
@@ -264,7 +260,7 @@ fn write_hex<W: std::fmt::Write>(w: &mut W, hash: &[u8]) -> std::fmt::Result {
 
 // TODO: go faster / simpler?
 fn hash_to_hash_id(hash: &Sha256dHash) -> Vec<u8> {
-    hash.clone().into_inner()[..SQL_HASH_ID_SIZE].to_vec()
+    hash.as_byte_array()[..SQL_HASH_ID_SIZE].to_vec()
 }
 
 fn hash_id_and_rest_to_hash(id_and_rest: (Vec<u8>, Vec<u8>)) -> BlockHash {
@@ -531,7 +527,7 @@ impl<'a> OutputFormatter<'a> {
             s.write_fmt(format_args!(
                 "'::bytea,{},{},{})",
                 vout,
-                output.value,
+                output.value.to_sat(),
                 crate::util::bitcoin::address_from_script(&output.script_pubkey, network)
                     .map(|a| format!("'{}'", a))
                     .unwrap_or_else(|| "NULL".into())
@@ -559,7 +555,7 @@ impl<'a> InputFormatter<'a> {
     fn fmt(&mut self, tx_id: &Sha256dHash, input: &bitcoin::TxIn) {
         self.input.fmt_with(move |s| {
             s.write_str("('\\x").unwrap();
-            write_hash_id_hex(s, &input.previous_output.txid.as_hash()).unwrap();
+            write_hash_id_hex(s, input.previous_output.txid.as_raw_hash()).unwrap();
             s.write_fmt(format_args!("'::bytea,{},'\\x", input.previous_output.vout))
                 .unwrap();
             write_hash_id_hex(s, &tx_id).unwrap();
@@ -587,7 +583,7 @@ impl<'a> BlockTxFormatter<'a> {
     fn fmt(&mut self, block: &BlockData, tx_id: &Sha256dHash) {
         self.block_tx.fmt_with(move |s| {
             s.write_str("('\\x").unwrap();
-            write_hash_id_hex(s, &block.id.as_hash()).unwrap();
+            write_hash_id_hex(s, block.id.as_raw_hash()).unwrap();
             s.write_str("'::bytea,'\\x").unwrap();
             write_hash_id_hex(s, &tx_id).unwrap();
             s.write_str("'::bytea)").unwrap();
@@ -678,7 +674,7 @@ impl<'a> TxFormatter<'a> {
                 weight,
                 fee,
                 tx.lock_time,
-                tx.is_coin_base(),
+                tx.is_coinbase(),
                 block_height
                     .map(|h| h.to_string())
                     .unwrap_or_else(|| "NULL".into()),
@@ -697,19 +693,22 @@ impl<'a> TxFormatter<'a> {
         tx: &bitcoin::Transaction,
         tx_id: &TxHash,
     ) {
-        let is_coinbase = tx.is_coin_base();
+        let is_coinbase = tx.is_coinbase();
 
-        let fee = if tx.is_coin_base() {
+        let fee = if tx.is_coinbase() {
             0
         } else {
             let input_value_sum = tx.input.iter().fold(0, |acc, input| {
                 let p = HashIdOutPoint {
-                    tx_hash_id: hash_to_hash_id(&input.previous_output.txid.as_hash()),
+                    tx_hash_id: hash_to_hash_id(input.previous_output.txid.as_raw_hash()),
                     vout: input.previous_output.vout,
                 };
                 acc + self.inputs_utxo_map[&p].value
             });
-            let output_value_sum = tx.output.iter().fold(0, |acc, output| acc + output.value);
+            let output_value_sum = tx
+                .output
+                .iter()
+                .fold(0u64, |acc, output| acc + output.value.to_sat());
             assert!(output_value_sum <= input_value_sum);
             input_value_sum - output_value_sum
         };
@@ -780,22 +779,22 @@ impl<'a> BlockFormatter<'a> {
     fn fmt_one(&mut self, block: &BlockData) {
         self.event.fmt_with(|s| {
             s.write_str("('\\x").unwrap();
-            write_hash_id_hex(s, &block.id.as_hash()).unwrap();
+            write_hash_id_hex(s, block.id.as_raw_hash()).unwrap();
             s.write_str("'::bytea)").unwrap();
         });
 
         self.block.fmt_with(|s| {
             s.write_str("('\\x").unwrap();
-            write_hash_id_hex(s, &block.id.as_hash()).unwrap();
+            write_hash_id_hex(s, block.id.as_raw_hash()).unwrap();
 
             s.write_str("'::bytea,'\\x").unwrap();
-            write_hash_rest_hex(s, &block.id.as_hash()).unwrap();
+            write_hash_rest_hex(s, block.id.as_raw_hash()).unwrap();
 
             s.write_str("'::bytea,'\\x").unwrap();
-            write_hash_id_hex(s, &block.data.header.prev_blockhash.as_hash()).unwrap();
+            write_hash_id_hex(s, block.data.header.prev_blockhash.as_raw_hash()).unwrap();
 
             s.write_str("'::bytea,'\\x").unwrap();
-            write_hash_hex(s, &block.data.header.merkle_root.as_hash()).unwrap();
+            write_hash_hex(s, block.data.header.merkle_root.as_raw_hash()).unwrap();
 
             s.write_fmt(format_args!(
                 "'::bytea,{},{})",
@@ -810,8 +809,8 @@ impl<'a> BlockFormatter<'a> {
 
         for (tx_i, tx) in block.data.txdata.iter().enumerate() {
             let tx_id = &self.tx_ids[&(block.height, tx_i)];
-            self.tx_fmt.fmt(Some(block.height), tx, &tx_id.as_hash());
-            self.block_tx_fmt.fmt(block, &tx_id.as_hash());
+            self.tx_fmt.fmt(Some(block.height), tx, tx_id.as_raw_hash());
+            self.block_tx_fmt.fmt(block, tx_id.as_raw_hash());
         }
     }
 }
@@ -897,7 +896,7 @@ impl HashIdOutPoint {
 impl From<bitcoin::OutPoint> for HashIdOutPoint {
     fn from(p: bitcoin::OutPoint) -> Self {
         Self {
-            tx_hash_id: hash_to_hash_id(&p.txid.as_hash()),
+            tx_hash_id: hash_to_hash_id(p.txid.as_raw_hash()),
             vout: p.vout,
         }
     }
@@ -952,8 +951,8 @@ impl UtxoSetCache {
                 for (idx, output) in tx.output.iter().enumerate() {
                     let txid = &tx_ids[&(block.height, tx_i)];
                     self.insert(
-                        HashIdOutPoint::from_tx_hash_and_idx(&txid.as_hash(), idx as u32),
-                        output.value,
+                        HashIdOutPoint::from_tx_hash_and_idx(txid.as_raw_hash(), idx as u32),
+                        output.value.to_sat(),
                     );
                 }
             }
@@ -968,7 +967,7 @@ impl UtxoSetCache {
             blocks
                 .iter()
                 .flat_map(|block| &block.data.txdata)
-                .filter(|tx| !tx.is_coin_base())
+                .filter(|tx| !tx.is_coinbase())
                 .flat_map(|tx| &tx.input)
                 .map(|input| input.previous_output),
         )
@@ -1270,44 +1269,42 @@ fn fmt_insert_blockdata_sql(
             for (vout, txout) in tx.output.iter().enumerate() {
                 // Script classification using Address::from_script (bitcoin 0.32)
                 let (spk_type, wver_opt, wprog_len_opt, is_taproot_opt, xonly_opt) = {
-                    use bitcoin::util::address::{Payload, WitnessVersion};
-                    match Payload::from_script(&txout.script_pubkey) {
-                        Some(Payload::PubkeyHash(_)) => ("p2pkh", None, None, None, None),
-                        Some(Payload::ScriptHash(_)) => ("p2sh", None, None, None, None),
-                        Some(Payload::WitnessProgram { version, program }) => {
-                            let ver_num: i16 = match version {
-                                WitnessVersion::V0 => 0,
-                                WitnessVersion::V1 => 1,
-                                _ => 255,
-                            };
-                            let prog_len: i16 = program.len() as i16;
-                            if ver_num == 1 && program.len() == 32 {
-                                (
-                                    "p2tr",
-                                    Some(ver_num),
-                                    Some(prog_len),
-                                    Some(true),
-                                    Some(program.to_vec()),
-                                )
-                            } else if ver_num == 0 && program.len() == 20 {
-                                ("p2wpkh", Some(ver_num), Some(prog_len), None, None)
-                            } else if ver_num == 0 && program.len() == 32 {
-                                ("p2wsh", Some(ver_num), Some(prog_len), None, None)
-                            } else {
-                                ("witness", Some(ver_num), Some(prog_len), None, None)
-                            }
-                        }
-                        None => ("nonstandard", None, None, None, None),
+                    let spk = &txout.script_pubkey;
+                    let b = spk.as_bytes();
+                    if spk.is_p2pkh() {
+                        ("p2pkh", None, None, None, None::<Vec<u8>>)
+                    } else if spk.is_p2sh() {
+                        ("p2sh", None, None, None, None::<Vec<u8>>)
+                    } else if spk.is_p2wpkh() {
+                        ("p2wpkh", Some(0i16), Some(20i16), None, None::<Vec<u8>>)
+                    } else if spk.is_p2wsh() {
+                        ("p2wsh", Some(0i16), Some(32i16), None, None::<Vec<u8>>)
+                    } else if b.len() == 34
+                        && b[0] == bitcoin::opcodes::all::OP_PUSHNUM_1.to_u8()
+                        && b[1] == 32
+                    {
+                        // P2TR: OP_1 <32-byte x-only pubkey>
+                        (
+                            "p2tr",
+                            Some(1i16),
+                            Some(32i16),
+                            Some(true),
+                            Some(b[2..].to_vec()),
+                        )
+                    } else if spk.is_op_return() {
+                        ("op_return", None, None, None, None::<Vec<u8>>)
+                    } else {
+                        ("nonstandard", None, None, None, None::<Vec<u8>>)
                     }
                 };
 
                 output_meta_fmt.fmt_with(|s| {
                     // block_hash_id
                     s.write_str("('\\x").unwrap();
-                    write_hash_id_hex(s, &block.id.as_hash()).unwrap();
+                    write_hash_id_hex(s, block.id.as_raw_hash()).unwrap();
                     // tx_hash_id
                     s.write_str("'::bytea,'\\x").unwrap();
-                    write_hash_id_hex(s, &tx_id.as_hash()).unwrap();
+                    write_hash_id_hex(s, tx_id.as_raw_hash()).unwrap();
                     // tx_idx
                     s.write_fmt(format_args!("'::bytea,{}", vout)).unwrap();
                     // spk_type
@@ -1340,10 +1337,9 @@ fn fmt_insert_blockdata_sql(
                     }
                     // op_return_payload (extract for OP_RETURN if present)
                     {
-                        use bitcoin::blockdata::opcodes::all::OP_RETURN;
-                        let spk = &txout.script_pubkey;
-                        let spk_bytes = spk.as_bytes();
-                        if !spk_bytes.is_empty() && spk_bytes[0] == OP_RETURN.into_u8() {
+                        use bitcoin::opcodes::all::OP_RETURN;
+                        let spk_bytes = txout.script_pubkey.as_bytes();
+                        if !spk_bytes.is_empty() && spk_bytes[0] == OP_RETURN.to_u8() {
                             // Naive payload extraction: bytes after OP_RETURN and push opcode(s)
                             // Try to skip a single-byte push opcode if present, otherwise store the raw tail
                             let mut payload_start = 1usize;
@@ -1359,6 +1355,7 @@ fn fmt_insert_blockdata_sql(
                             write_hex(s, payload).unwrap();
                             s.write_str("'::bytea)").unwrap();
                         } else {
+                            // Not an OP_RETURN spk; no payload
                             s.write_str(",NULL)").unwrap();
                         }
                     }
@@ -1385,7 +1382,7 @@ fn fmt_insert_blockdata_sql(
     for block in blocks {
         for tx in block.data.txdata.iter() {
             let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
-            if tx.is_coin_base() {
+            if tx.is_coinbase() {
                 // Skip coinbase: previous_output is invalid (vout can be 0xffffffff)
                 continue;
             }
@@ -1435,17 +1432,17 @@ fn fmt_insert_blockdata_sql(
                     if let Ok(bitcoin::blockdata::script::Instruction::PushBytes(b)) = instr {
                         // If this push is a DER-encoded signature with trailing sighash, record it
                         if sighash_flags_opt.is_none() {
-                            if let Some(v) = parse_der_sighash(b) {
+                            if let Some(v) = parse_der_sighash(b.as_bytes()) {
                                 sighash_flags_opt = Some(v);
                             }
                         }
-                        redeem_script_bytes_opt = Some(b.to_vec());
+                        redeem_script_bytes_opt = Some(b.as_bytes().to_vec());
                     }
                 }
                 let mut redeem_script_hash_bytes: Option<Vec<u8>> = None;
                 if let Some(ref rs_bytes) = redeem_script_bytes_opt {
                     let h = bitcoin::hashes::sha256::Hash::hash(&rs_bytes[..]);
-                    let inner = h.into_inner();
+                    let inner = *h.as_byte_array();
                     redeem_script_hash_bytes = Some(inner.to_vec());
                     script_fmt.fmt_with(|s| {
                         s.write_str("('\\x").unwrap();
@@ -1461,7 +1458,7 @@ fn fmt_insert_blockdata_sql(
                 let mut script_hash_bytes: Option<Vec<u8>> = None;
                 if let Some(ref script_bytes) = script_bytes_opt {
                     let h = bitcoin::hashes::sha256::Hash::hash(&script_bytes);
-                    let inner = h.into_inner();
+                    let inner = *h.as_byte_array();
                     script_hash_bytes = Some(inner.to_vec());
                     script_fmt.fmt_with(|s| {
                         s.write_str("('\\x").unwrap();
@@ -1481,15 +1478,15 @@ fn fmt_insert_blockdata_sql(
                 input_reveals_fmt.fmt_with(|s| {
                     // block_hash_id
                     s.write_str("('\\x").unwrap();
-                    write_hash_id_hex(s, &block.id.as_hash()).unwrap();
+                    write_hash_id_hex(s, block.id.as_raw_hash()).unwrap();
                     // tx_hash_id
                     s.write_str("'::bytea,'\\x").unwrap();
-                    write_hash_id_hex(s, &tx_id.as_hash()).unwrap();
+                    write_hash_id_hex(s, tx_id.as_raw_hash()).unwrap();
                     // input_idx
                     s.write_fmt(format_args!("'::bytea,{}", iidx)).unwrap();
                     // output_tx_hash_id
                     s.write_str(",'\\x").unwrap();
-                    write_hash_id_hex(s, &input.previous_output.txid.as_hash()).unwrap();
+                    write_hash_id_hex(s, input.previous_output.txid.as_raw_hash()).unwrap();
                     // output_tx_idx
                     s.write_fmt(format_args!("'::bytea,{}", input.previous_output.vout))
                         .unwrap();
@@ -1538,17 +1535,7 @@ fn fmt_insert_blockdata_sql(
     drop(script_fmt);
     drop(input_reveals_fmt);
 
-    Ok(vec![
-        event_q,
-        block_q,
-        block_tx_q,
-        tx_q,
-        output_q,
-        input_q,
-        script_q,
-        input_reveals_q,
-        output_meta_q,
-    ])
+    Ok(vec![event_q, block_q, block_tx_q, tx_q, output_q, input_q])
 }
 impl AsyncBlockInsertWorker {
     fn new(
@@ -1641,7 +1628,7 @@ impl AsyncBlockInsertWorker {
                         "all block data",
                         block_ids.len(),
                         batch_id,
-                        queries.into_iter(),
+                        queries.into_iter().take(6),
                     )?;
 
                     let current_time = std::time::Instant::now();
@@ -2259,7 +2246,7 @@ impl IndexerStore {
             }
             prev_height = Some(block.height);
 
-            let block_hash_id = hash_to_hash_id(&block.id.as_hash());
+            let block_hash_id = hash_to_hash_id(block.id.as_raw_hash());
 
             match Self::read_db_block_extinct_by_hash_id_trans(&mut transaction, &block_hash_id)? {
                 Some(false) => panic!(
@@ -2527,7 +2514,7 @@ impl MempoolStore {
             utxo_map,
         );
 
-        formatter.fmt(None, tx, &tx_id.as_hash());
+        formatter.fmt(None, tx, tx_id.as_raw_hash());
 
         drop(formatter);
 
