@@ -1446,6 +1446,12 @@ fn fmt_insert_blockdata_sql(
             "INSERT INTO input_reveals(block_hash_id, tx_hash_id, input_idx, output_tx_hash_id, output_tx_idx, redeem_script_id, witness_script_id, taproot_leaf_script_id, taproot_control_block, annex_present, sighash_flags, is_taproot_key_spend, schnorr_sig_count) VALUES",
         );
 
+    // Miniscript parsing counters (batch-level)
+    let mut ms_legacy: usize = 0;
+    let mut ms_segwitv0: usize = 0;
+    let mut ms_tap: usize = 0;
+    let mut ms_fail: usize = 0;
+
     if true {
         for block in blocks {
             for tx in block.data.txdata.iter() {
@@ -1554,6 +1560,7 @@ fn fmt_insert_blockdata_sql(
                             {
                                 miniscript_ctx = Some("legacy");
                                 miniscript_text_opt = Some(ms.to_string());
+                                ms_legacy += 1;
                             } else if let Ok(ms) = miniscript::Miniscript::<
                                 bitcoin::PublicKey,
                                 miniscript::Segwitv0,
@@ -1562,6 +1569,7 @@ fn fmt_insert_blockdata_sql(
                             ) {
                                 miniscript_ctx = Some("segwitv0");
                                 miniscript_text_opt = Some(ms.to_string());
+                                ms_segwitv0 += 1;
                             } else if let Ok(ms) =
                                 miniscript::Miniscript::<
                                     bitcoin::secp256k1::XOnlyPublicKey,
@@ -1570,6 +1578,7 @@ fn fmt_insert_blockdata_sql(
                             {
                                 miniscript_ctx = Some("tap");
                                 miniscript_text_opt = Some(ms.to_string());
+                                ms_tap += 1;
                             }
                             if let Some(ctx) = miniscript_ctx {
                                 debug!(
@@ -1578,6 +1587,7 @@ fn fmt_insert_blockdata_sql(
                                     hex::encode(&inner[..])
                                 );
                             } else {
+                                ms_fail += 1;
                                 debug!(
                                     "miniscript parse failed script_id={}",
                                     hex::encode(&inner[..])
@@ -1651,6 +1661,7 @@ fn fmt_insert_blockdata_sql(
                             {
                                 miniscript_ctx = Some("legacy");
                                 miniscript_text_opt = Some(ms.to_string());
+                                ms_legacy += 1;
                             } else if let Ok(ms) = miniscript::Miniscript::<
                                 bitcoin::PublicKey,
                                 miniscript::Segwitv0,
@@ -1659,6 +1670,7 @@ fn fmt_insert_blockdata_sql(
                             ) {
                                 miniscript_ctx = Some("segwitv0");
                                 miniscript_text_opt = Some(ms.to_string());
+                                ms_segwitv0 += 1;
                             } else if let Ok(ms) =
                                 miniscript::Miniscript::<
                                     bitcoin::secp256k1::XOnlyPublicKey,
@@ -1667,6 +1679,7 @@ fn fmt_insert_blockdata_sql(
                             {
                                 miniscript_ctx = Some("tap");
                                 miniscript_text_opt = Some(ms.to_string());
+                                ms_tap += 1;
                             }
                             if let Some(ctx) = miniscript_ctx {
                                 debug!(
@@ -1675,6 +1688,7 @@ fn fmt_insert_blockdata_sql(
                                     hex::encode(&inner[..])
                                 );
                             } else {
+                                ms_fail += 1;
                                 debug!(
                                     "miniscript parse failed script_id={}",
                                     hex::encode(&inner[..])
@@ -1800,6 +1814,15 @@ fn fmt_insert_blockdata_sql(
     drop(script_fmt);
     drop(input_reveals_fmt);
     drop(script_features_fmt);
+
+    // Miniscript batch counters summary
+    let total_ms = ms_legacy + ms_segwitv0 + ms_tap + ms_fail;
+    if total_ms > 0 {
+        debug!(
+            "miniscript batch summary: legacy={} segwitv0={} tap={} fail={}",
+            ms_legacy, ms_segwitv0, ms_tap, ms_fail
+        );
+    }
 
     {
         let mut v = vec![event_q, block_q, block_tx_q, tx_q, output_q, input_q];
