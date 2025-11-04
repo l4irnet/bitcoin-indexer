@@ -522,20 +522,19 @@ impl<'a> OutputFormatter<'a> {
     fn fmt(&mut self, tx_id: &Sha256dHash, output: &bitcoin::TxOut, vout: u32) {
         let network = self.network;
 
-        // Optional logging/metrics for script classification behind INDEX_SCRIPTS toggle
-        if crate::util::script::is_enabled() {
-            if let Some(meta) = crate::util::script::classify_if_enabled(&output.script_pubkey) {
-                debug!(
-                    "INDEX_SCRIPTS: tx_id={:?} vout={} spk_type={:?} wver={:?} wlen={:?} is_taproot={} opret_len={}",
-                    tx_id,
-                    vout,
-                    meta.spk_type,
-                    meta.witness_version,
-                    meta.witness_program_len,
-                    meta.taproot_xonly_pubkey.is_some(),
-                    meta.op_return_payload.as_ref().map(|v| v.len()).unwrap_or(0)
-                );
-            }
+        // Script classification logging/metrics (always on)
+        {
+            let meta = crate::util::script::classify(&output.script_pubkey);
+            debug!(
+                "INDEX_SCRIPTS: tx_id={:?} vout={} spk_type={:?} wver={:?} wlen={:?} is_taproot={} opret_len={}",
+                tx_id,
+                vout,
+                meta.spk_type,
+                meta.witness_version,
+                meta.witness_program_len,
+                meta.taproot_xonly_pubkey.is_some(),
+                meta.op_return_payload.as_ref().map(|v| v.len()).unwrap_or(0)
+            );
         }
 
         self.output.fmt_with(|s| {
@@ -1280,7 +1279,7 @@ fn fmt_insert_blockdata_sql(
         "INSERT INTO output_meta(block_hash_id, tx_hash_id, tx_idx, spk_type, witness_version, witness_program_len, is_taproot, taproot_xonly_pubkey, op_return_payload) VALUES",
     );
 
-    if crate::util::script::is_enabled() {
+    if true {
         for block in blocks {
             for tx in block.data.txdata.iter() {
                 let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
@@ -1398,156 +1397,165 @@ fn fmt_insert_blockdata_sql(
         "INSERT INTO input_reveals(block_hash_id, tx_hash_id, input_idx, output_tx_hash_id, output_tx_idx, redeem_script_id, witness_script_id, taproot_leaf_script_id, taproot_control_block, annex_present, sighash_flags) VALUES",
     );
 
-    for block in blocks {
-        for tx in block.data.txdata.iter() {
-            let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
-            if tx.is_coinbase() {
-                // Skip coinbase: previous_output is invalid (vout can be 0xffffffff)
-                continue;
-            }
-            for (iidx, input) in tx.input.iter().enumerate() {
-                // Extract witness/leaf/control for segwit/taproot
-                let mut script_bytes_opt: Option<Vec<u8>> = None;
-                let mut taproot_control_opt: Option<Vec<u8>> = None;
-                let mut annex_present_opt: Option<bool> = None;
-                let mut sighash_flags_opt: Option<i32> = None;
-                if !input.witness.is_empty() {
-                    let w: Vec<&[u8]> = input.witness.iter().collect();
-                    let wlen = w.len();
-                    // Annex is present if the first stack item starts with 0x50 (per BIP-342)
-                    if let Some(first) = w.get(0) {
-                        if !first.is_empty() && first[0] == 0x50 {
-                            annex_present_opt = Some(true);
-                        }
-                    }
-                    // Try to derive sighash flags from any DER-encoded signature in the witness
-                    for elm in &w {
-                        if let Some(v) = parse_der_sighash(elm) {
-                            sighash_flags_opt = Some(v);
-                            break;
-                        }
-                    }
-                    if wlen >= 2 {
-                        // Heuristic: last is control block (taproot script path), second last is leaf script
-                        let leaf_script = &w[wlen - 2];
-                        let control_block = &w[wlen - 1];
-                        if !leaf_script.is_empty() {
-                            script_bytes_opt = Some(leaf_script.to_vec());
-                        }
-                        if !control_block.is_empty() {
-                            taproot_control_opt = Some(control_block.to_vec());
-                        }
-                    } else if let Some(last) = w.last() {
-                        if !last.is_empty() {
-                            // Single-item witness: likely a WPKH witness; no script to record here
-                            script_bytes_opt = None;
-                        }
-                    }
-                }
-
-                // Extract potential P2SH redeemScript from scriptSig: take the last push bytes if any
-                let mut redeem_script_bytes_opt: Option<Vec<u8>> = None;
-                for instr in input.script_sig.instructions() {
-                    if let Ok(bitcoin::blockdata::script::Instruction::PushBytes(b)) = instr {
-                        // If this push is a DER-encoded signature with trailing sighash, record it
-                        if sighash_flags_opt.is_none() {
-                            if let Some(v) = parse_der_sighash(b.as_bytes()) {
-                                sighash_flags_opt = Some(v);
-                            }
-                        }
-                        redeem_script_bytes_opt = Some(b.as_bytes().to_vec());
-                    }
-                }
-                let mut redeem_script_hash_bytes: Option<Vec<u8>> = None;
-                if let Some(ref rs_bytes) = redeem_script_bytes_opt {
-                    let h = bitcoin::hashes::sha256::Hash::hash(&rs_bytes[..]);
-                    let inner = *h.as_byte_array();
-                    redeem_script_hash_bytes = Some(inner.to_vec());
-                    script_fmt.fmt_with(|s| {
-                        s.write_str("('\\x").unwrap();
-                        s.write_str(&hex::encode(&inner[..])).unwrap();
-                        s.write_str("'::bytea,'").unwrap();
-                        s.write_str(&hex::encode(&rs_bytes[..])).unwrap();
-                        s.write_str("',").unwrap();
-                        s.write_fmt(format_args!("{}", rs_bytes.len())).unwrap();
-                        s.write_str(",NULL)").unwrap();
-                    });
-                }
-
-                let mut script_hash_bytes: Option<Vec<u8>> = None;
-                if let Some(ref script_bytes) = script_bytes_opt {
-                    let h = bitcoin::hashes::sha256::Hash::hash(&script_bytes);
-                    let inner = *h.as_byte_array();
-                    script_hash_bytes = Some(inner.to_vec());
-                    script_fmt.fmt_with(|s| {
-                        s.write_str("('\\x").unwrap();
-                        s.write_str(&hex::encode(&inner[..])).unwrap();
-                        s.write_str("'::bytea,'").unwrap();
-                        s.write_str(&hex::encode(&script_bytes[..])).unwrap();
-                        s.write_str("',").unwrap();
-                        s.write_fmt(format_args!("{}", script_bytes.len())).unwrap();
-                        s.write_str(",NULL)").unwrap();
-                    });
-                }
-
-                // Skip if vout doesn't fit into INT column (e.g., coinbase 0xffffffff)
-                if input.previous_output.vout > i32::MAX as u32 {
+    let do_spend_reveals = std::env::var("INDEX_SPEND_REVEALS")
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            s == "1" || s == "true" || s == "yes" || s == "on"
+        })
+        .unwrap_or(false);
+    if do_spend_reveals {
+        for block in blocks {
+            for tx in block.data.txdata.iter() {
+                let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
+                if tx.is_coinbase() {
+                    // Skip coinbase: previous_output is invalid (vout can be 0xffffffff)
                     continue;
                 }
-                input_reveals_fmt.fmt_with(|s| {
-                    // block_hash_id
-                    s.write_str("('\\x").unwrap();
-                    write_hash_id_hex(s, block.id.as_raw_hash()).unwrap();
-                    // tx_hash_id
-                    s.write_str("'::bytea,'\\x").unwrap();
-                    write_hash_id_hex(s, tx_id.as_raw_hash()).unwrap();
-                    // input_idx
-                    s.write_fmt(format_args!("'::bytea,{}", iidx)).unwrap();
-                    // output_tx_hash_id
-                    s.write_str(",'\\x").unwrap();
-                    write_hash_id_hex(s, input.previous_output.txid.as_raw_hash()).unwrap();
-                    // output_tx_idx
-                    s.write_fmt(format_args!("'::bytea,{}", input.previous_output.vout))
-                        .unwrap();
-                    // redeem_script_id
-                    if let Some(ref hbytes) = redeem_script_hash_bytes {
+                for (iidx, input) in tx.input.iter().enumerate() {
+                    // Extract witness/leaf/control for segwit/taproot
+                    let mut script_bytes_opt: Option<Vec<u8>> = None;
+                    let mut taproot_control_opt: Option<Vec<u8>> = None;
+                    let mut annex_present_opt: Option<bool> = None;
+                    let mut sighash_flags_opt: Option<i32> = None;
+                    if !input.witness.is_empty() {
+                        let w: Vec<&[u8]> = input.witness.iter().collect();
+                        let wlen = w.len();
+                        // Annex is present if the first stack item starts with 0x50 (per BIP-342)
+                        if let Some(first) = w.get(0) {
+                            if !first.is_empty() && first[0] == 0x50 {
+                                annex_present_opt = Some(true);
+                            }
+                        }
+                        // Try to derive sighash flags from any DER-encoded signature in the witness
+                        for elm in &w {
+                            if let Some(v) = parse_der_sighash(elm) {
+                                sighash_flags_opt = Some(v);
+                                break;
+                            }
+                        }
+                        if wlen >= 2 {
+                            // Heuristic: last is control block (taproot script path), second last is leaf script
+                            let leaf_script = &w[wlen - 2];
+                            let control_block = &w[wlen - 1];
+                            if !leaf_script.is_empty() {
+                                script_bytes_opt = Some(leaf_script.to_vec());
+                            }
+                            if !control_block.is_empty() {
+                                taproot_control_opt = Some(control_block.to_vec());
+                            }
+                        } else if let Some(last) = w.last() {
+                            if !last.is_empty() {
+                                // Single-item witness: likely a WPKH witness; no script to record here
+                                script_bytes_opt = None;
+                            }
+                        }
+                    }
+
+                    // Extract potential P2SH redeemScript from scriptSig: take the last push bytes if any
+                    let mut redeem_script_bytes_opt: Option<Vec<u8>> = None;
+                    for instr in input.script_sig.instructions() {
+                        if let Ok(bitcoin::blockdata::script::Instruction::PushBytes(b)) = instr {
+                            // If this push is a DER-encoded signature with trailing sighash, record it
+                            if sighash_flags_opt.is_none() {
+                                if let Some(v) = parse_der_sighash(b.as_bytes()) {
+                                    sighash_flags_opt = Some(v);
+                                }
+                            }
+                            redeem_script_bytes_opt = Some(b.as_bytes().to_vec());
+                        }
+                    }
+                    let mut redeem_script_hash_bytes: Option<Vec<u8>> = None;
+                    if let Some(ref rs_bytes) = redeem_script_bytes_opt {
+                        let h = bitcoin::hashes::sha256::Hash::hash(&rs_bytes[..]);
+                        let inner = *h.as_byte_array();
+                        redeem_script_hash_bytes = Some(inner.to_vec());
+                        script_fmt.fmt_with(|s| {
+                            s.write_str("('\\x").unwrap();
+                            s.write_str(&hex::encode(&inner[..])).unwrap();
+                            s.write_str("'::bytea,'").unwrap();
+                            s.write_str(&hex::encode(&rs_bytes[..])).unwrap();
+                            s.write_str("',").unwrap();
+                            s.write_fmt(format_args!("{}", rs_bytes.len())).unwrap();
+                            s.write_str(",NULL)").unwrap();
+                        });
+                    }
+
+                    let mut script_hash_bytes: Option<Vec<u8>> = None;
+                    if let Some(ref script_bytes) = script_bytes_opt {
+                        let h = bitcoin::hashes::sha256::Hash::hash(&script_bytes);
+                        let inner = *h.as_byte_array();
+                        script_hash_bytes = Some(inner.to_vec());
+                        script_fmt.fmt_with(|s| {
+                            s.write_str("('\\x").unwrap();
+                            s.write_str(&hex::encode(&inner[..])).unwrap();
+                            s.write_str("'::bytea,'").unwrap();
+                            s.write_str(&hex::encode(&script_bytes[..])).unwrap();
+                            s.write_str("',").unwrap();
+                            s.write_fmt(format_args!("{}", script_bytes.len())).unwrap();
+                            s.write_str(",NULL)").unwrap();
+                        });
+                    }
+
+                    // Skip if vout doesn't fit into INT column (e.g., coinbase 0xffffffff)
+                    if input.previous_output.vout > i32::MAX as u32 {
+                        continue;
+                    }
+                    input_reveals_fmt.fmt_with(|s| {
+                        // block_hash_id
+                        s.write_str("('\\x").unwrap();
+                        write_hash_id_hex(s, block.id.as_raw_hash()).unwrap();
+                        // tx_hash_id
+                        s.write_str("'::bytea,'\\x").unwrap();
+                        write_hash_id_hex(s, tx_id.as_raw_hash()).unwrap();
+                        // input_idx
+                        s.write_fmt(format_args!("'::bytea,{}", iidx)).unwrap();
+                        // output_tx_hash_id
                         s.write_str(",'\\x").unwrap();
-                        s.write_str(&hex::encode(&hbytes[..])).unwrap();
-                        s.write_str("'::bytea").unwrap();
-                    } else {
+                        write_hash_id_hex(s, input.previous_output.txid.as_raw_hash()).unwrap();
+                        // output_tx_idx
+                        s.write_fmt(format_args!("'::bytea,{}", input.previous_output.vout))
+                            .unwrap();
+                        // redeem_script_id
+                        if let Some(ref hbytes) = redeem_script_hash_bytes {
+                            s.write_str(",'\\x").unwrap();
+                            s.write_str(&hex::encode(&hbytes[..])).unwrap();
+                            s.write_str("'::bytea").unwrap();
+                        } else {
+                            s.write_str(",NULL").unwrap();
+                        }
+                        // witness_script_id
+                        if let Some(ref hbytes) = script_hash_bytes {
+                            s.write_str(",'\\x").unwrap();
+                            s.write_str(&hex::encode(&hbytes[..])).unwrap();
+                            s.write_str("'::bytea").unwrap();
+                        } else {
+                            s.write_str(",NULL").unwrap();
+                        }
+                        // taproot_leaf_script_id
                         s.write_str(",NULL").unwrap();
-                    }
-                    // witness_script_id
-                    if let Some(ref hbytes) = script_hash_bytes {
-                        s.write_str(",'\\x").unwrap();
-                        s.write_str(&hex::encode(&hbytes[..])).unwrap();
-                        s.write_str("'::bytea").unwrap();
-                    } else {
-                        s.write_str(",NULL").unwrap();
-                    }
-                    // taproot_leaf_script_id
-                    s.write_str(",NULL").unwrap();
-                    // taproot_control_block
-                    if let Some(ref ctrl) = taproot_control_opt {
-                        s.write_str(",'\\x").unwrap();
-                        write_hex(s, &ctrl[..]).unwrap();
-                        s.write_str("'::bytea").unwrap();
-                    } else {
-                        s.write_str(",NULL").unwrap();
-                    }
-                    // annex_present
-                    if let Some(true) = annex_present_opt {
-                        s.write_str(",true").unwrap();
-                    } else {
-                        s.write_str(",NULL").unwrap();
-                    }
-                    // sighash_flags
-                    if let Some(v) = sighash_flags_opt {
-                        s.write_fmt(format_args!(",{})", v)).unwrap();
-                    } else {
-                        s.write_str(",NULL)").unwrap();
-                    }
-                });
+                        // taproot_control_block
+                        if let Some(ref ctrl) = taproot_control_opt {
+                            s.write_str(",'\\x").unwrap();
+                            write_hex(s, &ctrl[..]).unwrap();
+                            s.write_str("'::bytea").unwrap();
+                        } else {
+                            s.write_str(",NULL").unwrap();
+                        }
+                        // annex_present
+                        if let Some(true) = annex_present_opt {
+                            s.write_str(",true").unwrap();
+                        } else {
+                            s.write_str(",NULL").unwrap();
+                        }
+                        // sighash_flags
+                        if let Some(v) = sighash_flags_opt {
+                            s.write_fmt(format_args!(",{})", v)).unwrap();
+                        } else {
+                            s.write_str(",NULL)").unwrap();
+                        }
+                    });
+                }
             }
         }
     }
@@ -1558,6 +1566,12 @@ fn fmt_insert_blockdata_sql(
         let mut v = vec![event_q, block_q, block_tx_q, tx_q, output_q, input_q];
         if !output_meta_q.is_empty() {
             v.push(output_meta_q);
+        }
+        if !script_q.is_empty() {
+            v.push(script_q);
+        }
+        if !input_reveals_q.is_empty() {
+            v.push(input_reveals_q);
         }
         Ok(v)
     }
@@ -1614,8 +1628,8 @@ impl AsyncBlockInsertWorker {
                         fmt_insert_blockdata_sql(&blocks, inputs_utxo_map, tx_ids, mode, network)?;
 
                     let tx_len = blocks.iter().map(|b| b.data.txdata.len()).sum();
-                    if crate::util::script::is_enabled() {
-                        // Batch-level metrics for script classification
+                    // Batch-level metrics for script classification (always on)
+                    {
                         let mut total_outputs: usize = 0;
                         let mut p2pkh = 0usize;
                         let mut p2sh = 0usize;

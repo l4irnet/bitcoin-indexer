@@ -1,10 +1,5 @@
 /*!
-Utilities for parsing and classifying scriptPubKey, gated by an environment toggle.
-
-Toggle:
-- INDEX_SCRIPTS: when set to a truthy value ("1", "true", "yes", "on"), opt-in helpers like
-  `classify_if_enabled` will return Some(...). Otherwise they return None.
-  Core pure functions (like `classify`) are always available.
+Utilities for parsing and classifying scriptPubKey.
 
 This module is Stage 3 of the roadmap:
 - Provides standalone helpers only; no DB writes.
@@ -12,24 +7,6 @@ This module is Stage 3 of the roadmap:
 */
 
 use bitcoin::{opcodes, Script};
-
-/// Returns true if INDEX_SCRIPTS is set to a truthy value.
-/// Supported truthy values (case-insensitive): "1", "true", "yes", "on".
-pub fn is_enabled() -> bool {
-    truthy_env("INDEX_SCRIPTS")
-}
-
-/// Return Some(meta) only when INDEX_SCRIPTS toggle is enabled; otherwise None.
-///
-/// You can use this to guard optional indexing or logging logic without scattering
-/// env checks in the callsite.
-pub fn classify_if_enabled(spk: &Script) -> Option<SpkMeta> {
-    if is_enabled() {
-        Some(classify(spk))
-    } else {
-        None
-    }
-}
 
 /// Classification of a scriptPubKey.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,17 +156,6 @@ pub fn op_return_payload(spk: &Script) -> Option<Vec<u8>> {
     Some(b[1..].to_vec())
 }
 
-/// Read an env var and interpret it as truthy.
-fn truthy_env(key: &str) -> bool {
-    match std::env::var(key) {
-        Ok(v) => {
-            let s = v.trim().to_ascii_lowercase();
-            matches!(s.as_str(), "1" | "true" | "yes" | "on")
-        }
-        Err(_) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,15 +271,5 @@ mod tests {
         assert_eq!(m.spk_type, SpkType::Witness);
         assert_eq!(m.witness_version, Some(2));
         assert_eq!(m.witness_program_len, Some(2));
-    }
-
-    #[test]
-    fn toggle_is_false_by_default() {
-        // Ensure classify_if_enabled returns None without the env var
-        // (This test may fail if the env is set outside; it's a sanity check.)
-        if std::env::var("INDEX_SCRIPTS").is_err() {
-            let s = p2pkh_script();
-            assert!(classify_if_enabled(&s).is_none());
-        }
     }
 }
