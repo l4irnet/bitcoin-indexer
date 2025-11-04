@@ -35,6 +35,48 @@ mod pg {
     // pub type Result<T> = std::result::Result<T, postgres::error::Error>;
 }
 
+// Stage 9: opcode/policy-level script feature parsing
+fn decode_small_int(op: u8) -> Option<u8> {
+    use bitcoin::opcodes::all::*;
+    if op == OP_PUSHBYTES_0.to_u8() {
+        return Some(0);
+    }
+    let one = OP_PUSHNUM_1.to_u8();
+    let sixteen = OP_PUSHNUM_16.to_u8();
+    if op >= one && op <= sixteen {
+        return Some(op - one + 1);
+    }
+    None
+}
+
+/// Return (has_cltv, has_csv, multisig_m, multisig_n)
+fn parse_script_features(script: &bitcoin::Script) -> (bool, bool, Option<i32>, Option<i32>) {
+    use bitcoin::opcodes::all::*;
+    let b = script.as_bytes();
+
+    let has_cltv = b.contains(&OP_CLTV.to_u8());
+    let has_csv = b.contains(&OP_CSV.to_u8());
+
+    // Bare multisig heuristic: OP_m <pubkeys...> OP_n OP_CHECKMULTISIG[VERIFY]
+    let mut m_opt: Option<i32> = None;
+    let mut n_opt: Option<i32> = None;
+
+    if let Some(&last) = b.last() {
+        if last == OP_CHECKMULTISIG.to_u8() || last == OP_CHECKMULTISIGVERIFY.to_u8() {
+            if b.len() >= 3 {
+                let op_m = b[0];
+                let op_n = b[b.len() - 2];
+                if let (Some(m), Some(n)) = (decode_small_int(op_m), decode_small_int(op_n)) {
+                    m_opt = Some(m as i32);
+                    n_opt = Some(n as i32);
+                }
+            }
+        }
+    }
+
+    (has_cltv, has_csv, m_opt, n_opt)
+}
+
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
@@ -1390,12 +1432,19 @@ fn fmt_insert_blockdata_sql(
         "INSERT INTO script(id, script_hex, size, summary) VALUES",
     );
 
+    // Then script_features (append-only, keyed by script_id)
+    let mut script_features_q = String::new();
+    let mut script_features_fmt = MultiValueSqlFormatter::new_on_conflict_do_nothing(
+            &mut script_features_q,
+            "INSERT INTO script_features(script_id, has_cltv, has_csv, multisig_m, multisig_n, miniscript) VALUES",
+        );
+
     // Then input_reveals, referencing scripts where applicable (append-only)
     let mut input_reveals_q = String::new();
     let mut input_reveals_fmt = MultiValueSqlFormatter::new_on_conflict_do_nothing(
-        &mut input_reveals_q,
-        "INSERT INTO input_reveals(block_hash_id, tx_hash_id, input_idx, output_tx_hash_id, output_tx_idx, redeem_script_id, witness_script_id, taproot_leaf_script_id, taproot_control_block, annex_present, sighash_flags, is_taproot_key_spend, schnorr_sig_count) VALUES",
-    );
+            &mut input_reveals_q,
+            "INSERT INTO input_reveals(block_hash_id, tx_hash_id, input_idx, output_tx_hash_id, output_tx_idx, redeem_script_id, witness_script_id, taproot_leaf_script_id, taproot_control_block, annex_present, sighash_flags, is_taproot_key_spend, schnorr_sig_count) VALUES",
+        );
 
     if true {
         for block in blocks {
@@ -1481,6 +1530,7 @@ fn fmt_insert_blockdata_sql(
                         let h = bitcoin::hashes::sha256::Hash::hash(&rs_bytes[..]);
                         let inner = *h.as_byte_array();
                         redeem_script_hash_bytes = Some(inner.to_vec());
+                        // Insert into script registry (dedup)
                         script_fmt.fmt_with(|s| {
                             s.write_str("('\\x").unwrap();
                             s.write_str(&hex::encode(&inner[..])).unwrap();
@@ -1490,6 +1540,53 @@ fn fmt_insert_blockdata_sql(
                             s.write_fmt(format_args!("{}", rs_bytes.len())).unwrap();
                             s.write_str(",NULL)").unwrap();
                         });
+                        // Populate script_features from decoded opcodes
+                        {
+                            let sb = bitcoin::ScriptBuf::from_bytes(rs_bytes.clone());
+                            let (has_cltv, has_csv, multisig_m, multisig_n) =
+                                parse_script_features(sb.as_script());
+                            let miniscript_text_opt = miniscript::Miniscript::<bitcoin::PublicKey, miniscript::Legacy>::parse(sb.as_script())
+                                .map(|ms| ms.to_string())
+                                .or_else(|_| miniscript::Miniscript::<bitcoin::PublicKey, miniscript::Segwitv0>::parse(sb.as_script()).map(|ms| ms.to_string()))
+                                .or_else(|_| miniscript::Miniscript::<bitcoin::secp256k1::XOnlyPublicKey, miniscript::Tap>::parse(sb.as_script()).map(|ms| ms.to_string()))
+                                .ok();
+                            script_features_fmt.fmt_with(|s| {
+                                s.write_str("('\\x").unwrap();
+                                s.write_str(&hex::encode(&inner[..])).unwrap();
+                                s.write_str("'::bytea,").unwrap();
+                                // has_cltv, has_csv
+                                if has_cltv {
+                                    s.write_str("true").unwrap();
+                                } else {
+                                    s.write_str("false").unwrap();
+                                }
+                                s.write_str(",").unwrap();
+                                if has_csv {
+                                    s.write_str("true").unwrap();
+                                } else {
+                                    s.write_str("false").unwrap();
+                                }
+                                // multisig_m, multisig_n
+                                if let Some(m) = multisig_m {
+                                    s.write_fmt(format_args!(",{}", m)).unwrap();
+                                } else {
+                                    s.write_str(",NULL").unwrap();
+                                }
+                                if let Some(n) = multisig_n {
+                                    s.write_fmt(format_args!(",{}", n)).unwrap();
+                                } else {
+                                    s.write_str(",NULL").unwrap();
+                                }
+                                // miniscript (populate if parse succeeded)
+                                if let Some(ref ms) = miniscript_text_opt {
+                                    s.write_str(",'").unwrap();
+                                    s.write_str(ms).unwrap();
+                                    s.write_str("')").unwrap();
+                                } else {
+                                    s.write_str(",NULL)").unwrap();
+                                }
+                            });
+                        }
                     }
 
                     let mut script_hash_bytes: Option<Vec<u8>> = None;
@@ -1497,6 +1594,7 @@ fn fmt_insert_blockdata_sql(
                         let h = bitcoin::hashes::sha256::Hash::hash(&script_bytes);
                         let inner = *h.as_byte_array();
                         script_hash_bytes = Some(inner.to_vec());
+                        // Insert into script registry (dedup)
                         script_fmt.fmt_with(|s| {
                             s.write_str("('\\x").unwrap();
                             s.write_str(&hex::encode(&inner[..])).unwrap();
@@ -1506,6 +1604,53 @@ fn fmt_insert_blockdata_sql(
                             s.write_fmt(format_args!("{}", script_bytes.len())).unwrap();
                             s.write_str(",NULL)").unwrap();
                         });
+                        // Populate script_features from decoded opcodes
+                        {
+                            let sb = bitcoin::ScriptBuf::from_bytes(script_bytes.clone());
+                            let (has_cltv, has_csv, multisig_m, multisig_n) =
+                                parse_script_features(sb.as_script());
+                            let miniscript_text_opt = miniscript::Miniscript::<bitcoin::PublicKey, miniscript::Legacy>::parse(sb.as_script())
+                                .map(|ms| ms.to_string())
+                                .or_else(|_| miniscript::Miniscript::<bitcoin::PublicKey, miniscript::Segwitv0>::parse(sb.as_script()).map(|ms| ms.to_string()))
+                                .or_else(|_| miniscript::Miniscript::<bitcoin::secp256k1::XOnlyPublicKey, miniscript::Tap>::parse(sb.as_script()).map(|ms| ms.to_string()))
+                                .ok();
+                            script_features_fmt.fmt_with(|s| {
+                                s.write_str("('\\x").unwrap();
+                                s.write_str(&hex::encode(&inner[..])).unwrap();
+                                s.write_str("'::bytea,").unwrap();
+                                // has_cltv, has_csv
+                                if has_cltv {
+                                    s.write_str("true").unwrap();
+                                } else {
+                                    s.write_str("false").unwrap();
+                                }
+                                s.write_str(",").unwrap();
+                                if has_csv {
+                                    s.write_str("true").unwrap();
+                                } else {
+                                    s.write_str("false").unwrap();
+                                }
+                                // multisig_m, multisig_n
+                                if let Some(m) = multisig_m {
+                                    s.write_fmt(format_args!(",{}", m)).unwrap();
+                                } else {
+                                    s.write_str(",NULL").unwrap();
+                                }
+                                if let Some(n) = multisig_n {
+                                    s.write_fmt(format_args!(",{}", n)).unwrap();
+                                } else {
+                                    s.write_str(",NULL").unwrap();
+                                }
+                                // miniscript (populate if parse succeeded)
+                                if let Some(ref ms) = miniscript_text_opt {
+                                    s.write_str(",'").unwrap();
+                                    s.write_str(ms).unwrap();
+                                    s.write_str("')").unwrap();
+                                } else {
+                                    s.write_str(",NULL)").unwrap();
+                                }
+                            });
+                        }
                     }
 
                     // Skip if vout doesn't fit into INT column (e.g., coinbase 0xffffffff)
@@ -1588,6 +1733,7 @@ fn fmt_insert_blockdata_sql(
     }
     drop(script_fmt);
     drop(input_reveals_fmt);
+    drop(script_features_fmt);
 
     {
         let mut v = vec![event_q, block_q, block_tx_q, tx_q, output_q, input_q];
@@ -1596,6 +1742,9 @@ fn fmt_insert_blockdata_sql(
         }
         if !script_q.is_empty() {
             v.push(script_q);
+        }
+        if !script_features_q.is_empty() {
+            v.push(script_features_q);
         }
         if !input_reveals_q.is_empty() {
             v.push(input_reveals_q);
@@ -2173,138 +2322,6 @@ impl IndexerStore {
             mode.to_sql_query_str(),
             "set_schema_to_mode",
         )?;
-
-        // Stage 4: Append-only DDL scaffolding (idempotent, safe in all modes)
-        // - Create new tables if they don't exist
-        // - Avoid heavy indices by default; add selective indices/views in Normal mode
-        let base_ddl = r#"
-        -- script: deduplicated scripts (append-only)
-        CREATE TABLE IF NOT EXISTS script (
-          id BYTEA PRIMARY KEY,          -- hash of script bytes (e.g., sha256)
-          script_hex TEXT NOT NULL,
-          size INT NOT NULL,
-          summary TEXT NULL
-        );
-
-        -- output_meta: per-output classification per originating block (append-only)
-        CREATE TABLE IF NOT EXISTS output_meta (
-          block_hash_id BYTEA NOT NULL,
-          tx_hash_id BYTEA NOT NULL,
-          tx_idx INT NOT NULL,
-          spk_type TEXT NOT NULL,
-          witness_version SMALLINT NULL,
-          witness_program_len SMALLINT NULL,
-          is_taproot BOOLEAN NULL,
-          taproot_xonly_pubkey BYTEA NULL,
-          op_return_payload BYTEA NULL,
-          PRIMARY KEY (block_hash_id, tx_hash_id, tx_idx)
-        );
-
-        -- input_reveals: spend-time script details (append-only)
-        CREATE TABLE IF NOT EXISTS input_reveals (
-          block_hash_id BYTEA NOT NULL,
-          tx_hash_id BYTEA NOT NULL,
-          input_idx INT NOT NULL,
-          output_tx_hash_id BYTEA NULL,
-          output_tx_idx INT NULL,
-          redeem_script_id BYTEA NULL,
-          witness_script_id BYTEA NULL,
-          taproot_leaf_script_id BYTEA NULL,
-          taproot_control_block BYTEA NULL,
-          annex_present BOOLEAN NULL,
-          sighash_flags INT NULL,
-          PRIMARY KEY (block_hash_id, tx_hash_id, input_idx)
-        );
-
-        -- script_features: optional parsed opcode/policy features keyed by script
-        CREATE TABLE IF NOT EXISTS script_features (
-          script_id BYTEA PRIMARY KEY,
-          has_cltv BOOLEAN NULL,
-          has_csv BOOLEAN NULL,
-          multisig_m SMALLINT NULL,
-          multisig_n SMALLINT NULL,
-          miniscript TEXT NULL
-        );
-        "#;
-
-        Self::batch_execute_with_log(
-            &mut self.connection,
-            base_ddl,
-            "set_schema_to_mode:stage4_base",
-        )?;
-
-        // Stage 8 incremental columns (idempotent)
-        let alter_stage8 = r#"
-        ALTER TABLE input_reveals
-          ADD COLUMN IF NOT EXISTS is_taproot_key_spend BOOLEAN NULL;
-        ALTER TABLE input_reveals
-          ADD COLUMN IF NOT EXISTS schnorr_sig_count INT NULL;
-        "#;
-
-        Self::batch_execute_with_log(
-            &mut self.connection,
-            alter_stage8,
-            "set_schema_to_mode:stage8_alter",
-        )?;
-
-        // In Normal mode, create ergonomic views and selective indices to support analytics.
-        if let Mode::Normal = mode {
-            let normal_ddl = r#"
-            -- Views to join non-extinct blocks with output/input metadata
-            CREATE OR REPLACE VIEW output_with_meta AS
-              SELECT
-                o.tx_hash_id,
-                o.tx_idx,
-                o.value,
-                om.spk_type,
-                om.witness_version,
-                om.witness_program_len,
-                om.is_taproot,
-                om.taproot_xonly_pubkey,
-                om.op_return_payload
-              FROM output AS o
-              JOIN block_tx AS bt ON bt.tx_hash_id = o.tx_hash_id
-              JOIN block AS b ON b.hash_id = bt.block_hash_id AND b.extinct = false
-              LEFT JOIN output_meta AS om
-                ON om.block_hash_id = b.hash_id
-               AND om.tx_hash_id = o.tx_hash_id
-               AND om.tx_idx = o.tx_idx;
-
-            CREATE OR REPLACE VIEW input_with_reveals AS
-              SELECT
-                i.tx_hash_id,
-                i.output_tx_hash_id,
-                i.output_tx_idx,
-                ir.redeem_script_id,
-                ir.witness_script_id,
-                ir.taproot_leaf_script_id,
-                ir.taproot_control_block,
-                ir.annex_present,
-                ir.sighash_flags
-              FROM input AS i
-              JOIN block_tx AS bt ON bt.tx_hash_id = i.tx_hash_id
-              JOIN block AS b ON b.hash_id = bt.block_hash_id AND b.extinct = false
-              LEFT JOIN input_reveals AS ir
-                ON ir.block_hash_id = b.hash_id
-               AND ir.tx_hash_id = i.tx_hash_id
-               AND ir.input_idx = (
-                 SELECT idx FROM (
-                   SELECT row_number() OVER () - 1 AS idx
-                 ) AS t WHERE idx = 0
-               );
-
-            -- Selective indices for frequent filters
-            CREATE INDEX IF NOT EXISTS idx_output_meta_spk_type ON output_meta (spk_type);
-            CREATE INDEX IF NOT EXISTS idx_output_meta_is_taproot ON output_meta (is_taproot);
-            CREATE INDEX IF NOT EXISTS idx_output_meta_wver ON output_meta (witness_version);
-            "#;
-
-            Self::batch_execute_with_log(
-                &mut self.connection,
-                normal_ddl,
-                "set_schema_to_mode:stage4_normal",
-            )?;
-        }
 
         Ok(())
     }

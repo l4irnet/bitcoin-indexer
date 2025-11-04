@@ -26,6 +26,7 @@ hex = "0.4"
 secp256k1 = "0.22"
 crossbeam-channel = "*"
 structopt = "*"
+clap = { version = "4", features = ["derive"] }
 default = "*"
 dotenv = "*"
 postgres = "0.19.1"
@@ -37,6 +38,7 @@ env_logger = { version = "*", default-features = false, features = ["termcolor",
 itertools = "0.8"
 url = "2"
 fallible-iterator = "0.2"
+miniscript = "12"
 
 openssl = "0.10"
 postgres-openssl = "0.5"

@@ -110,16 +110,24 @@ impl Config {
 }
 
 fn run() -> Result<()> {
-    dotenv::dotenv()?;
-
-    let config = Config::from_env()?;
-
+    // Parse CLI first so we can load a specific env file if requested.
     let opts: opts::Opts = structopt::StructOpt::from_args();
 
+    // Load environment variables: use provided env file if set, otherwise default .env
+    if let Some(ref path) = opts.env_file {
+        let _ = dotenv::from_filename(path);
+    } else {
+        let _ = dotenv::dotenv();
+    }
+
+    // Handle wipe-and-exit
     if opts.wipe_db {
         db::pg::IndexerStore::wipe(&env::var("DATABASE_URL")?)?;
         return Ok(());
     }
+
+    // Build config from env after loading
+    let config = Config::from_env()?;
 
     let mut indexer = Indexer::new(config)?;
     indexer.run()?;

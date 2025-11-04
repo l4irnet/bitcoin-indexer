@@ -105,15 +105,17 @@ CREATE TABLE IF NOT EXISTS input_reveals (
   block_hash_id BYTEA NOT NULL,
   tx_hash_id BYTEA NOT NULL,
   input_idx INT NOT NULL,
-  output_tx_hash_id BYTEA NOT NULL,
-  output_tx_idx INT NOT NULL,
+  output_tx_hash_id BYTEA,
+  output_tx_idx INT,
   redeem_script_id BYTEA,
   witness_script_id BYTEA,
   taproot_leaf_script_id BYTEA,
   taproot_control_block BYTEA,
   annex_present BOOLEAN,
   sighash_flags INT,
-  PRIMARY KEY (block_hash_id, tx_hash_id, output_tx_hash_id, output_tx_idx)
+  is_taproot_key_spend BOOLEAN,
+  schnorr_sig_count INT,
+  PRIMARY KEY (block_hash_id, tx_hash_id, input_idx)
 );
 
 -- script_features: derived opcode/policy features keyed by script (append-only)
@@ -121,9 +123,9 @@ CREATE TABLE IF NOT EXISTS script_features (
   script_id BYTEA NOT NULL UNIQUE PRIMARY KEY,
   has_cltv BOOLEAN,
   has_csv BOOLEAN,
-  multisig_m INT,
-  multisig_n INT,
-  template TEXT,
+  multisig_m SMALLINT,
+  multisig_n SMALLINT,
+  miniscript TEXT,
   CONSTRAINT fk_script_features_script_id FOREIGN KEY (script_id)
     REFERENCES script(id)
     ON DELETE CASCADE
