@@ -1280,103 +1280,105 @@ fn fmt_insert_blockdata_sql(
         "INSERT INTO output_meta(block_hash_id, tx_hash_id, tx_idx, spk_type, witness_version, witness_program_len, is_taproot, taproot_xonly_pubkey, op_return_payload) VALUES",
     );
 
-    for block in blocks {
-        for tx in block.data.txdata.iter() {
-            let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
-            for (vout, txout) in tx.output.iter().enumerate() {
-                // Script classification using Address::from_script (bitcoin 0.32)
-                let (spk_type, wver_opt, wprog_len_opt, is_taproot_opt, xonly_opt) = {
-                    let spk = &txout.script_pubkey;
-                    let b = spk.as_bytes();
-                    if spk.is_p2pkh() {
-                        ("p2pkh", None, None, None, None::<Vec<u8>>)
-                    } else if spk.is_p2sh() {
-                        ("p2sh", None, None, None, None::<Vec<u8>>)
-                    } else if spk.is_p2wpkh() {
-                        ("p2wpkh", Some(0i16), Some(20i16), None, None::<Vec<u8>>)
-                    } else if spk.is_p2wsh() {
-                        ("p2wsh", Some(0i16), Some(32i16), None, None::<Vec<u8>>)
-                    } else if b.len() == 34
-                        && b[0] == bitcoin::opcodes::all::OP_PUSHNUM_1.to_u8()
-                        && b[1] == 32
-                    {
-                        // P2TR: OP_1 <32-byte x-only pubkey>
-                        (
-                            "p2tr",
-                            Some(1i16),
-                            Some(32i16),
-                            Some(true),
-                            Some(b[2..].to_vec()),
-                        )
-                    } else if spk.is_op_return() {
-                        ("op_return", None, None, None, None::<Vec<u8>>)
-                    } else {
-                        ("nonstandard", None, None, None, None::<Vec<u8>>)
-                    }
-                };
-
-                output_meta_fmt.fmt_with(|s| {
-                    // block_hash_id
-                    s.write_str("('\\x").unwrap();
-                    write_hash_id_hex(s, block.id.as_raw_hash()).unwrap();
-                    // tx_hash_id
-                    s.write_str("'::bytea,'\\x").unwrap();
-                    write_hash_id_hex(s, tx_id.as_raw_hash()).unwrap();
-                    // tx_idx
-                    s.write_fmt(format_args!("'::bytea,{}", vout)).unwrap();
-                    // spk_type
-                    s.write_fmt(format_args!(",'{}'", spk_type)).unwrap();
-                    // witness_version
-                    if let Some(v) = wver_opt {
-                        s.write_fmt(format_args!(",{}", v)).unwrap();
-                    } else {
-                        s.write_str(",NULL").unwrap();
-                    }
-                    // witness_program_len
-                    if let Some(l) = wprog_len_opt {
-                        s.write_fmt(format_args!(",{}", l)).unwrap();
-                    } else {
-                        s.write_str(",NULL").unwrap();
-                    }
-                    // is_taproot
-                    if let Some(true) = is_taproot_opt {
-                        s.write_str(",true").unwrap();
-                    } else {
-                        s.write_str(",NULL").unwrap();
-                    }
-                    // taproot_xonly_pubkey
-                    if let Some(prog) = xonly_opt {
-                        s.write_str(",'\\x").unwrap();
-                        write_hex(s, &prog).unwrap();
-                        s.write_str("'::bytea").unwrap();
-                    } else {
-                        s.write_str(",NULL").unwrap();
-                    }
-                    // op_return_payload (extract for OP_RETURN if present)
-                    {
-                        use bitcoin::opcodes::all::OP_RETURN;
-                        let spk_bytes = txout.script_pubkey.as_bytes();
-                        if !spk_bytes.is_empty() && spk_bytes[0] == OP_RETURN.to_u8() {
-                            // Naive payload extraction: bytes after OP_RETURN and push opcode(s)
-                            // Try to skip a single-byte push opcode if present, otherwise store the raw tail
-                            let mut payload_start = 1usize;
-                            if spk_bytes.len() > 1 {
-                                let push = spk_bytes[1] as usize;
-                                // minimal support for small immediate push (<=75 bytes)
-                                if push <= 75 && spk_bytes.len() >= 2 + push {
-                                    payload_start = 2;
-                                }
-                            }
-                            let payload = &spk_bytes[payload_start..];
-                            s.write_str(",'\\x").unwrap();
-                            write_hex(s, payload).unwrap();
-                            s.write_str("'::bytea)").unwrap();
+    if crate::util::script::is_enabled() {
+        for block in blocks {
+            for tx in block.data.txdata.iter() {
+                let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
+                for (vout, txout) in tx.output.iter().enumerate() {
+                    // Script classification using Address::from_script (bitcoin 0.32)
+                    let (spk_type, wver_opt, wprog_len_opt, is_taproot_opt, xonly_opt) = {
+                        let spk = &txout.script_pubkey;
+                        let b = spk.as_bytes();
+                        if spk.is_p2pkh() {
+                            ("p2pkh", None, None, None, None::<Vec<u8>>)
+                        } else if spk.is_p2sh() {
+                            ("p2sh", None, None, None, None::<Vec<u8>>)
+                        } else if spk.is_p2wpkh() {
+                            ("p2wpkh", Some(0i16), Some(20i16), None, None::<Vec<u8>>)
+                        } else if spk.is_p2wsh() {
+                            ("p2wsh", Some(0i16), Some(32i16), None, None::<Vec<u8>>)
+                        } else if b.len() == 34
+                            && b[0] == bitcoin::opcodes::all::OP_PUSHNUM_1.to_u8()
+                            && b[1] == 32
+                        {
+                            // P2TR: OP_1 <32-byte x-only pubkey>
+                            (
+                                "p2tr",
+                                Some(1i16),
+                                Some(32i16),
+                                Some(true),
+                                Some(b[2..].to_vec()),
+                            )
+                        } else if spk.is_op_return() {
+                            ("op_return", None, None, None, None::<Vec<u8>>)
                         } else {
-                            // Not an OP_RETURN spk; no payload
-                            s.write_str(",NULL)").unwrap();
+                            ("nonstandard", None, None, None, None::<Vec<u8>>)
                         }
-                    }
-                });
+                    };
+
+                    output_meta_fmt.fmt_with(|s| {
+                        // block_hash_id
+                        s.write_str("('\\x").unwrap();
+                        write_hash_id_hex(s, block.id.as_raw_hash()).unwrap();
+                        // tx_hash_id
+                        s.write_str("'::bytea,'\\x").unwrap();
+                        write_hash_id_hex(s, tx_id.as_raw_hash()).unwrap();
+                        // tx_idx
+                        s.write_fmt(format_args!("'::bytea,{}", vout)).unwrap();
+                        // spk_type
+                        s.write_fmt(format_args!(",'{}'", spk_type)).unwrap();
+                        // witness_version
+                        if let Some(v) = wver_opt {
+                            s.write_fmt(format_args!(",{}", v)).unwrap();
+                        } else {
+                            s.write_str(",NULL").unwrap();
+                        }
+                        // witness_program_len
+                        if let Some(l) = wprog_len_opt {
+                            s.write_fmt(format_args!(",{}", l)).unwrap();
+                        } else {
+                            s.write_str(",NULL").unwrap();
+                        }
+                        // is_taproot
+                        if let Some(true) = is_taproot_opt {
+                            s.write_str(",true").unwrap();
+                        } else {
+                            s.write_str(",NULL").unwrap();
+                        }
+                        // taproot_xonly_pubkey
+                        if let Some(prog) = xonly_opt {
+                            s.write_str(",'\\x").unwrap();
+                            write_hex(s, &prog).unwrap();
+                            s.write_str("'::bytea").unwrap();
+                        } else {
+                            s.write_str(",NULL").unwrap();
+                        }
+                        // op_return_payload (extract for OP_RETURN if present)
+                        {
+                            use bitcoin::opcodes::all::OP_RETURN;
+                            let spk_bytes = txout.script_pubkey.as_bytes();
+                            if !spk_bytes.is_empty() && spk_bytes[0] == OP_RETURN.to_u8() {
+                                // Naive payload extraction: bytes after OP_RETURN and push opcode(s)
+                                // Try to skip a single-byte push opcode if present, otherwise store the raw tail
+                                let mut payload_start = 1usize;
+                                if spk_bytes.len() > 1 {
+                                    let push = spk_bytes[1] as usize;
+                                    // minimal support for small immediate push (<=75 bytes)
+                                    if push <= 75 && spk_bytes.len() >= 2 + push {
+                                        payload_start = 2;
+                                    }
+                                }
+                                let payload = &spk_bytes[payload_start..];
+                                s.write_str(",'\\x").unwrap();
+                                write_hex(s, payload).unwrap();
+                                s.write_str("'::bytea)").unwrap();
+                            } else {
+                                // Not an OP_RETURN spk; no payload
+                                s.write_str(",NULL)").unwrap();
+                            }
+                        }
+                    });
+                }
             }
         }
     }
@@ -1552,7 +1554,13 @@ fn fmt_insert_blockdata_sql(
     drop(script_fmt);
     drop(input_reveals_fmt);
 
-    Ok(vec![event_q, block_q, block_tx_q, tx_q, output_q, input_q])
+    {
+        let mut v = vec![event_q, block_q, block_tx_q, tx_q, output_q, input_q];
+        if !output_meta_q.is_empty() {
+            v.push(output_meta_q);
+        }
+        Ok(v)
+    }
 }
 impl AsyncBlockInsertWorker {
     fn new(
@@ -1681,7 +1689,7 @@ impl AsyncBlockInsertWorker {
                         "all block data",
                         block_ids.len(),
                         batch_id,
-                        queries.into_iter().take(6),
+                        queries.into_iter(),
                     )?;
 
                     let current_time = std::time::Instant::now();

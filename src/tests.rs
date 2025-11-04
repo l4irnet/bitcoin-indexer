@@ -243,17 +243,15 @@ fn prefetcher_reorg_reliability(start: Option<u8>, mut reorgs_seed: Vec<(u8, u8,
 
     debug!("starting chain: {:?}", chain);
 
-    let start = start.map(|start| {
+    let start = start.and_then(|start| {
         let prefetcher_starting_height = BlockHeight::from(start).saturating_sub(window_size);
-        let prefetcher_starting_id = rpc
-            .get_block_id_by_height(prefetcher_starting_height)
-            .unwrap()
-            .unwrap();
-
-        WithHeightAndId {
-            height: prefetcher_starting_height,
-            id: prefetcher_starting_id,
-            data: (),
+        match rpc.get_block_id_by_height(prefetcher_starting_height) {
+            Ok(Some(prefetcher_starting_id)) => Some(WithHeightAndId {
+                height: prefetcher_starting_height,
+                id: prefetcher_starting_id,
+                data: (),
+            }),
+            _ => None,
         }
     });
 
