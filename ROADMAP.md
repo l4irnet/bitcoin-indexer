@@ -1,5 +1,62 @@
 # Roadmap: Upgrade `bitcoin` crate and extend script indexing
 
+Status summary (Nov 2025)
+- Stage 1 — bitcoincore-rpc 0.19.x: DONE
+- Stage 2 — bitcoin 0.32.x (compat mode): IN PROGRESS (next)
+- Stage 3 — Script parsing utilities: PARTIAL (finish after Stage 2)
+- Stage 4 — Schema scaffolding (append-only): DONE
+- Stage 5 — Output classification write path: DONE
+- Stage 6 — Script registry population: DONE
+- Stage 7 — Witness/redeem/taproot extraction (incl. annex, control block, sighash flags): DONE
+- Stage 8 — Taproot key/script-spend + schnorr details: PARTIAL (add explicit flags/fields)
+- Stage 9 — Opcode/policy analytics (script_features population): PENDING
+- Stage 10 — Views/indices (normal mode): DONE
+- Stage 11 — Backfill tool: PENDING
+- Stage 12 — Cleanup/hardening: IN PROGRESS (better logging, robust shutdown, configurable flush)
+
+Immediate next steps (Stage 2: bitcoin 0.32.x upgrade)
+- Build and compile
+  - Update Cargo dependency to bitcoin = "0.32.x"
+  - Adapt APIs:
+    - Transaction: use compute_txid(); is_coinbase() (new spelling)
+    - Script types: switch to bitcoin::Script and bitcoin::ScriptBuf
+    - Address: Address::from_script(script, network) and addr.payload()
+    - Hash types: use associated Hash types from bitcoin_hashes (no as_hash/as_inner/into_inner)
+    - Amount/value: ensure correct integer types; avoid adding Amount to integers; convert explicitly
+    - Script parsing: iterate via script.instructions(); PushBytes in bitcoin::script::Instruction
+- Re-test and fix classification/extraction
+  - Output classification via Address::from_script; record witness version/program length; P2TR x-only program
+  - OP_RETURN parsing via script opcodes (keep heuristic lightweight)
+  - input_reveals: redeemScript (P2SH), witness/taproot leaf, control block, annex detection
+  - Sighash flags: keep robust DER+flag parser
+- Migration hygiene
+  - Keep all new writes append-only with ON CONFLICT DO NOTHING
+  - Maintain current bulk/normal mode behavior (no new FKs in bulk)
+  - Verify resume after crash (INDEXER_REWIND configurable)
+- Validation
+  - Run end-to-end indexing over a small range; sanity-check views and counts
+  - Diff baseline vs new DB using the compare script/query approach
+
+Follow-ups after Stage 2
+- Stage 3: finalize script parsing helpers (typed, unit-tested) on 0.32.x
+- Stage 8: add explicit fields for taproot key-vs-script spend in input_reveals (e.g., is_taproot_key_spend)
+- Stage 9: populate script_features (has_cltv, has_csv, multisig m/n, optional miniscript string)
+- Stage 11: add a resumable backfill CLI to populate output_meta/input_reveals/script_features for historical ranges
+
+Operational toggles (current)
+- INDEXER_REWIND: blocks to rewind on resume (default 100; set 0 for exact resume)
+- INDEXER_BULK_FLUSH_TXS: tx threshold per DB flush in bulk mode (default 100000)
+- INDEXER_BULK_FLUSH_BLOCKS: block threshold per DB flush in bulk mode (default 100)
+- PGSSL* envs for mTLS: PGSSLROOTCERT, PGSSLCERT, PGSSLKEY
+- (Optional) INDEXER_SELF_TEST=1 to run mode flip self-test (disabled by default)
+
+Notes on safety/performance
+- All new tables (script, output_meta, input_reveals, script_features) are append-only; normal mode adds FKs/indices; bulk mode avoids them
+- Inserts to new tables always use ON CONFLICT DO NOTHING to remain idempotent
+- Coinbase inputs are skipped for input_reveals; vout overflow is guarded
+- Writer pipeline is robust to channel/worker failures; errors are logged with SQLSTATE/code/detail; exponential PG connect backoff reduces startup storms
+
+
 This document outlines a staged, incremental plan to:
 1) Upgrade the `bitcoin` crate from v0.28 to v0.32.x, and
 2) Expand our indexing capabilities (script classification, witness/redeem/taproot details, and opcode/policy features),

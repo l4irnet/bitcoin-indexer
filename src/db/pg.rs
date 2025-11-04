@@ -1268,7 +1268,7 @@ fn fmt_insert_blockdata_sql(
         for tx in block.data.txdata.iter() {
             let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
             for (vout, txout) in tx.output.iter().enumerate() {
-                // Script classification based on address::Payload (struct variant for WitnessProgram)
+                // Script classification using Address::from_script (bitcoin 0.32)
                 let (spk_type, wver_opt, wprog_len_opt, is_taproot_opt, xonly_opt) = {
                     use bitcoin::util::address::{Payload, WitnessVersion};
                     match Payload::from_script(&txout.script_pubkey) {
