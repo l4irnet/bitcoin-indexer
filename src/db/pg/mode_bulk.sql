@@ -135,3 +135,28 @@ ALTER TABLE output SET (
 ALTER TABLE input SET (
   autovacuum_enabled = false, toast.autovacuum_enabled = false
 );
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_script_features_script_id') THEN
+    ALTER TABLE script_features
+    DROP CONSTRAINT fk_script_features_script_id;
+  END IF;
+END;
+$$;
+
+ALTER TABLE script SET (
+  autovacuum_enabled = false, toast.autovacuum_enabled = false
+);
+
+ALTER TABLE output_meta SET (
+  autovacuum_enabled = false, toast.autovacuum_enabled = false
+);
+
+ALTER TABLE input_reveals SET (
+  autovacuum_enabled = false, toast.autovacuum_enabled = false
+);
+
+ALTER TABLE script_features SET (
+  autovacuum_enabled = false, toast.autovacuum_enabled = false
+);

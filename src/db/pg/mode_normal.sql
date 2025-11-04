@@ -1,3 +1,131 @@
+-- Add FKs and indices for new append-only tables in normal mode
+
+-- Ergonomic views: outputs joined with output_meta via non-extinct blocks
+CREATE OR REPLACE VIEW output_with_meta AS
+  SELECT
+    o.tx_hash_id,
+    o.tx_idx,
+    o.value,
+    o.address,
+    b.hash_id AS block_hash_id,
+    b.height AS block_height,
+    om.spk_type,
+    om.witness_version,
+    om.witness_program_len,
+    om.is_taproot,
+    om.taproot_xonly_pubkey,
+    om.op_return_payload
+  FROM output AS o
+  JOIN block_tx AS bt ON bt.tx_hash_id = o.tx_hash_id
+  JOIN block AS b ON b.hash_id = bt.block_hash_id AND b.extinct = false
+  LEFT JOIN output_meta AS om
+    ON om.block_hash_id = b.hash_id
+   AND om.tx_hash_id = o.tx_hash_id
+   AND om.tx_idx = o.tx_idx;
+
+-- Ergonomic views: inputs joined with input_reveals via non-extinct blocks
+CREATE OR REPLACE VIEW input_with_reveals AS
+  SELECT
+    i.tx_hash_id AS spending_tx_hash_id,
+    i.output_tx_hash_id,
+    i.output_tx_idx,
+    i.has_witness,
+    b.hash_id AS block_hash_id,
+    b.height AS block_height,
+    ir.redeem_script_id,
+    ir.witness_script_id,
+    ir.taproot_leaf_script_id,
+    ir.taproot_control_block,
+    ir.annex_present,
+    ir.sighash_flags
+  FROM input AS i
+  JOIN block_tx AS bt ON bt.tx_hash_id = i.tx_hash_id
+  JOIN block AS b ON b.hash_id = bt.block_hash_id AND b.extinct = false
+  LEFT JOIN input_reveals AS ir
+    ON ir.block_hash_id = b.hash_id
+   AND ir.tx_hash_id = i.tx_hash_id
+   AND ir.output_tx_hash_id = i.output_tx_hash_id
+   AND ir.output_tx_idx = i.output_tx_idx;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_output_meta_block_hash_id') THEN
+    ALTER TABLE output_meta
+    ADD CONSTRAINT fk_output_meta_block_hash_id FOREIGN KEY (block_hash_id)
+      REFERENCES block(hash_id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+
+
+CREATE INDEX IF NOT EXISTS output_meta_spk_type ON output_meta (spk_type);
+CREATE INDEX IF NOT EXISTS output_meta_is_taproot ON output_meta (is_taproot);
+CREATE INDEX IF NOT EXISTS output_meta_taproot_xonly_pubkey ON output_meta USING hash (taproot_xonly_pubkey);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_input_reveals_block_hash_id') THEN
+    ALTER TABLE input_reveals
+    ADD CONSTRAINT fk_input_reveals_block_hash_id FOREIGN KEY (block_hash_id)
+      REFERENCES block(hash_id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_input_reveals_redeem_script_id') THEN
+    ALTER TABLE input_reveals
+    ADD CONSTRAINT fk_input_reveals_redeem_script_id FOREIGN KEY (redeem_script_id)
+      REFERENCES script(id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_input_reveals_witness_script_id') THEN
+    ALTER TABLE input_reveals
+    ADD CONSTRAINT fk_input_reveals_witness_script_id FOREIGN KEY (witness_script_id)
+      REFERENCES script(id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_input_reveals_taproot_leaf_script_id') THEN
+    ALTER TABLE input_reveals
+    ADD CONSTRAINT fk_input_reveals_taproot_leaf_script_id FOREIGN KEY (taproot_leaf_script_id)
+      REFERENCES script(id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+CREATE INDEX IF NOT EXISTS input_reveals_redeem_script_id ON input_reveals (redeem_script_id);
+CREATE INDEX IF NOT EXISTS input_reveals_witness_script_id ON input_reveals (witness_script_id);
+CREATE INDEX IF NOT EXISTS input_reveals_taproot_leaf_script_id ON input_reveals (taproot_leaf_script_id);
+
+
+
+CREATE INDEX IF NOT EXISTS input_reveals_outpoint ON input_reveals (output_tx_hash_id, output_tx_idx);
+
+CREATE INDEX IF NOT EXISTS script_size ON script (size);
+CREATE INDEX IF NOT EXISTS script_features_multisig ON script_features (multisig_m, multisig_n);
+
 -- normal mode schema: after reaching chainhead/first reorg
 -- we build all indices, etc. to enable all the queries etc.
 -- we also define some utitlity functions
@@ -83,6 +211,43 @@ BEGIN
     ALTER TABLE output ADD PRIMARY KEY (tx_hash_id, tx_idx);
   END IF;
 END $$;
+
+-- Moved here to ensure referenced unique/primary keys exist
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_output_meta_tx_hash_id') THEN
+    ALTER TABLE output_meta
+    ADD CONSTRAINT fk_output_meta_tx_hash_id FOREIGN KEY (tx_hash_id)
+      REFERENCES tx(hash_id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_input_reveals_tx_hash_id') THEN
+    ALTER TABLE input_reveals
+    ADD CONSTRAINT fk_input_reveals_tx_hash_id FOREIGN KEY (tx_hash_id)
+      REFERENCES tx(hash_id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_input_reveals_output_outpoint') THEN
+    ALTER TABLE input_reveals
+    ADD CONSTRAINT fk_input_reveals_output_outpoint FOREIGN KEY (output_tx_hash_id, output_tx_idx)
+      REFERENCES output(tx_hash_id, tx_idx)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
 CREATE INDEX IF NOT EXISTS output_address ON output USING hash (address);
 CREATE INDEX IF NOT EXISTS output_value ON output (value);
 
@@ -203,7 +368,7 @@ CREATE OR REPLACE VIEW tx_with_block AS
 -- select all txes that have null `current_height`, and which outputs were not used by any other tx yet
 -- BUG: to **really** check if something is in the mempool, we would have to double check
 -- if all the outputs it uses are also in the mempool or unspent **recursively** which is hard to do in SQL
--- Actually: recursive SQL queries are a thing, Postrgres supports them well and they might just work. TBD. 
+-- Actually: recursive SQL queries are a thing, Postrgres supports them well and they might just work. TBD.
 CREATE OR REPLACE VIEW tx_hash_ids_in_mempool AS
   SELECT
     tx.hash_id
@@ -351,4 +516,3 @@ ALTER TABLE input SET (
 ALTER TABLE input SET (
   autovacuum_enabled = false, toast.autovacuum_enabled = false
 );
-

@@ -1,4 +1,4 @@
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 
 use crate::{prelude::*, BlockHeight, Rpc, RpcBlock, RpcBlockWithPrevId, WithHeightAndId};
 use bitcoincore_rpc::RpcApi;
@@ -23,7 +23,7 @@ fn retry<T>(mut f: impl FnMut() -> Result<T>) -> T {
             Err(e) => {
                 std::thread::sleep(Duration::from_millis(delay_ms));
                 if count % 1000 == 0 {
-                    eprintln!("{}; retrying ...", e.display_causes_and_backtrace());
+                    warn!("{}; retrying ...", e.display_causes_and_backtrace());
                 }
                 count += 1;
             }

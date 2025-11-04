@@ -77,3 +77,55 @@ CREATE TABLE IF NOT EXISTS input (
   output_tx_hash_id BYTEA NOT NULL, -- output id this tx input spends
   tx_hash_id BYTEA NOT NULL -- tx id this input is from
 );
+
+-- script: deduplicated revealed scripts (append-only)
+CREATE TABLE IF NOT EXISTS script (
+  id BYTEA NOT NULL UNIQUE PRIMARY KEY,
+  script_hex TEXT NOT NULL,
+  size INT NOT NULL,
+  summary TEXT
+);
+
+-- output_meta: per-output classification per originating block (append-only)
+CREATE TABLE IF NOT EXISTS output_meta (
+  block_hash_id BYTEA NOT NULL,
+  tx_hash_id BYTEA NOT NULL,
+  tx_idx INT NOT NULL,
+  spk_type TEXT NOT NULL,
+  witness_version SMALLINT,
+  witness_program_len SMALLINT,
+  is_taproot BOOLEAN,
+  taproot_xonly_pubkey BYTEA,
+  op_return_payload BYTEA,
+  PRIMARY KEY (block_hash_id, tx_hash_id, tx_idx)
+);
+
+-- input_reveals: spend-time script details (append-only)
+CREATE TABLE IF NOT EXISTS input_reveals (
+  block_hash_id BYTEA NOT NULL,
+  tx_hash_id BYTEA NOT NULL,
+  input_idx INT NOT NULL,
+  output_tx_hash_id BYTEA NOT NULL,
+  output_tx_idx INT NOT NULL,
+  redeem_script_id BYTEA,
+  witness_script_id BYTEA,
+  taproot_leaf_script_id BYTEA,
+  taproot_control_block BYTEA,
+  annex_present BOOLEAN,
+  sighash_flags INT,
+  PRIMARY KEY (block_hash_id, tx_hash_id, output_tx_hash_id, output_tx_idx)
+);
+
+-- script_features: derived opcode/policy features keyed by script (append-only)
+CREATE TABLE IF NOT EXISTS script_features (
+  script_id BYTEA NOT NULL UNIQUE PRIMARY KEY,
+  has_cltv BOOLEAN,
+  has_csv BOOLEAN,
+  multisig_m INT,
+  multisig_n INT,
+  template TEXT,
+  CONSTRAINT fk_script_features_script_id FOREIGN KEY (script_id)
+    REFERENCES script(id)
+    ON DELETE CASCADE
+    DEFERRABLE INITIALLY DEFERRED
+);

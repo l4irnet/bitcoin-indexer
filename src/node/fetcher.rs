@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::{BlockHeight, WithHeightAndId};
 use common_failures::prelude::*;
+use log::warn;
 
 /// Block fetcher
 ///
@@ -74,7 +75,7 @@ where
                         break;
                     }
                     Err(_e) => {
-                        eprintln!("Retrying `getblockcount`");
+                        warn!("Retrying `getblockcount`");
                     }
                 }
             }

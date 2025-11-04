@@ -2,10 +2,11 @@ use bitcoin_indexer::{db, node::fetcher, prelude::*, util::reversed};
 use itertools::Itertools;
 use std::{borrow::Borrow, env, sync::Arc};
 
-use common_failures::quick_main;
+use common_failures::prelude::*;
+use log::info;
 
 fn run() -> Result<()> {
-    env_logger::init();
+    // logger is initialized in main(); avoid double init
     dotenv::dotenv()?;
     let db_url = env::var("DATABASE_URL")?;
     let node_url = env::var("NODE_RPC_URL")?;
@@ -28,7 +29,7 @@ fn run() -> Result<()> {
         let mut transaction = db.transaction()?;
         for (i, item) in batch.enumerate() {
             if i == 0 {
-                eprintln!("Block {}H: {}", item.height, item.id);
+                info!("Block {}H: {}", item.height, item.id);
             }
             transaction.execute(
                 "UPDATE blocks SET time = $1, merkle_root = $2 WHERE hash = $3",
@@ -62,4 +63,11 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-quick_main!(run);
+fn main() {
+    // Best-effort initialize logger so top-level errors are visible even if run() fails early.
+    let _ = env_logger::try_init();
+    if let Err(e) = run() {
+        log::error!("Fatal: {}", e.display_causes_and_backtrace());
+        std::process::exit(1);
+    }
+}

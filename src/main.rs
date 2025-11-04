@@ -4,10 +4,10 @@ use bitcoin_indexer::{
     db, node::prefetcher, opts, prelude::*, types::*, util::BottleCheck, RpcInfo,
 };
 use bitcoincore_rpc::RpcApi;
-use log::info;
+use log::{error, info};
 use std::{env, sync::Arc};
 
-use common_failures::{prelude::*, quick_main};
+use common_failures::prelude::*;
 
 struct Indexer {
     node_starting_chainhead_height: BlockHeight,
@@ -44,7 +44,7 @@ impl Indexer {
     fn process_block(&mut self, block: BlockData) -> Result<()> {
         let block_height = block.height;
         if block_height >= self.node_starting_chainhead_height || block_height % 1000 == 0 {
-            eprintln!("Block {}H: {}", block.height, block.id);
+            info!("Block {}H: {}", block.height, block.id);
         }
 
         let Self {
@@ -63,13 +63,22 @@ impl Indexer {
                 info!("Last indexed block {}H", last_indexed_height);
 
                 assert!(last_indexed_height <= self.node_starting_chainhead_height);
-                let start_from_block = last_indexed_height.saturating_sub(100); // redo 100 last blocks, in case there was a reorg
+                let rewind: u32 = env::var("INDEXER_REWIND")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(100);
+                let start_from_block = last_indexed_height.saturating_sub(rewind); // configurable rewind
+                let start_hash = self
+                    .db
+                    .get_hash_by_height(start_from_block)?
+                    .expect("Block hash should be there");
+                info!(
+                    "Resuming with rewind={}, starting at {}H (hash={})",
+                    rewind, start_from_block, start_hash
+                );
                 Some(WithHeightAndId {
                     height: start_from_block,
-                    id: self
-                        .db
-                        .get_hash_by_height(start_from_block)?
-                        .expect("Block hash should be there"),
+                    id: start_hash,
                     data: (),
                 })
             } else {
@@ -103,7 +112,6 @@ impl Config {
 fn run() -> Result<()> {
     dotenv::dotenv()?;
 
-    env_logger::init();
     let config = Config::from_env()?;
 
     let opts: opts::Opts = structopt::StructOpt::from_args();
@@ -119,4 +127,11 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-quick_main!(run);
+fn main() {
+    // Best-effort initialize logger so top-level errors are visible even if run() fails early.
+    let _ = env_logger::try_init();
+    if let Err(e) = run() {
+        error!("Fatal: {}", e.display_causes_and_backtrace());
+        std::process::exit(1);
+    }
+}

@@ -6,13 +6,13 @@ use bitcoin_indexer::{
     types::WithId,
 };
 use bitcoincore_rpc::RpcApi;
-use log::trace;
+use log::{info, trace, warn};
 use std::{collections::HashSet, env};
 
-use common_failures::quick_main;
+use common_failures::prelude::*;
 
 fn run() -> Result<()> {
-    env_logger::init();
+    // logger is initialized in main(); avoid double init
     dotenv::dotenv()?;
     let db_url = env::var("DATABASE_URL")?;
     let node_url = env::var("NODE_RPC_URL")?;
@@ -76,7 +76,7 @@ fn run() -> Result<()> {
                 data: tx,
             }) {
                 Err(e) => {
-                    eprintln!("{}", e);
+                    warn!("{}", e);
                     failed += 1;
                 }
                 Ok(()) => {
@@ -85,9 +85,16 @@ fn run() -> Result<()> {
                 }
             }
         }
-        eprintln!("Scanned mempool; success: {}; failed: {}", inserted, failed);
+        info!("Scanned mempool; success: {}; failed: {}", inserted, failed);
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
 }
 
-quick_main!(run);
+fn main() {
+    // Best-effort initialize logger so top-level errors are visible even if run() fails early.
+    let _ = env_logger::try_init();
+    if let Err(e) = run() {
+        log::error!("Fatal: {}", e.display_causes_and_backtrace());
+        std::process::exit(1);
+    }
+}

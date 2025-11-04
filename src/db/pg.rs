@@ -24,6 +24,7 @@ use log::{debug, error, info, trace, warn};
 use super::*;
 use crate::{BlockHash, BlockHeight};
 use bitcoin::hash_types::Txid;
+use common_failures::prelude::*;
 use fallible_iterator::FallibleIterator;
 use hex::ToHex;
 use itertools::Itertools;
@@ -156,6 +157,7 @@ pub fn establish_connection(url: &str) -> pg::Client {
 
             let tls = postgres_openssl::MakeTlsConnector::new(builder.build());
 
+            let mut backoff = std::time::Duration::from_millis(250);
             loop {
                 match pg::Client::connect(url, tls.clone()) {
                     Err(e) => {
@@ -168,7 +170,9 @@ pub fn establish_connection(url: &str) -> pg::Client {
                             src = c.source();
                         }
                         warn!("Error connecting to PG (TLS): {}", msg);
-                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        std::thread::sleep(backoff);
+                        let next_ms = (backoff.as_millis().saturating_mul(2) as u64).min(30_000);
+                        backoff = std::time::Duration::from_millis(next_ms);
                     }
                     Ok(o) => return o,
                 }
@@ -180,13 +184,14 @@ pub fn establish_connection(url: &str) -> pg::Client {
     #[cfg(not(feature = "pg_tls_openssl"))]
     {
         if ca.is_some() || cert.is_some() || key.is_some() {
-            eprintln!(
+            warn!(
                 "PGSSL* env vars detected, but binary is built without 'pg_tls_openssl' feature; falling back to non-TLS"
             );
         }
     }
 
     // Fallback: non-TLS connection.
+    let mut backoff = std::time::Duration::from_millis(250);
     loop {
         match pg::Client::connect(url, postgres::tls::NoTls) {
             Err(e) => {
@@ -199,7 +204,9 @@ pub fn establish_connection(url: &str) -> pg::Client {
                     src = c.source();
                 }
                 warn!("Error connecting to PG: {}", msg);
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                std::thread::sleep(backoff);
+                let next_ms = (backoff.as_millis().saturating_mul(2) as u64).min(30_000);
+                backoff = std::time::Duration::from_millis(next_ms);
             }
             Ok(o) => return o,
         }
@@ -270,6 +277,137 @@ fn hash_id_and_rest_to_hash(id_and_rest: (Vec<u8>, Vec<u8>)) -> BlockHash {
 
 const SQL_INSERT_VALUES_SIZE: usize = 30000;
 const SQL_HASH_ID_SIZE: usize = 16;
+
+/// Parse a DER-encoded ECDSA signature with a trailing sighash flag byte.
+/// Returns Some(sighash) if the structure is valid and minimally encoded, otherwise None.
+/// This does not validate the signature cryptographically; it only parses the structure:
+/// 0x30 | total_len | 0x02 | r_len | r | 0x02 | s_len | s | sighash
+fn parse_der_sighash(sig: &[u8]) -> Option<i32> {
+    // Need at least: 0x30, len, 0x02, r_len, r(1), 0x02, s_len, s(1), sighash(1)
+    if sig.len() < 9 || sig[0] != 0x30 {
+        return None;
+    }
+    let total_len = sig[1] as usize;
+    // DER sequence length does not include the sighash byte; overall length must be total_len + 2 (tag+len) + 1 (sighash)
+    if sig.len() != total_len + 3 {
+        return None;
+    }
+    // Offsets
+    let mut off = 2;
+    // Expect INTEGER R
+    if off >= sig.len() || sig[off] != 0x02 {
+        return None;
+    }
+    off += 1;
+    if off >= sig.len() {
+        return None;
+    }
+    let r_len = sig[off] as usize;
+    off += 1;
+    // r must exist
+    if off + r_len > sig.len() {
+        return None;
+    }
+    // Minimal encoding for R: no leading zero unless needed to avoid negative
+    if r_len == 0 {
+        return None;
+    }
+    if sig[off] == 0x00 && r_len > 1 && (sig[off + 1] & 0x80) == 0 {
+        return None;
+    }
+    off += r_len;
+
+    // Expect INTEGER S
+    if off >= sig.len() || sig[off] != 0x02 {
+        return None;
+    }
+    off += 1;
+    if off >= sig.len() {
+        return None;
+    }
+    let s_len = sig[off] as usize;
+    off += 1;
+    if off + s_len > sig.len() {
+        return None;
+    }
+    // Minimal encoding for S
+    if s_len == 0 {
+        return None;
+    }
+    if sig[off] == 0x00 && s_len > 1 && (sig[off + 1] & 0x80) == 0 {
+        return None;
+    }
+    off += s_len;
+
+    // After R and S, we must be at exactly end-1 (the last byte is sighash)
+    if off != 2 + total_len {
+        return None;
+    }
+    let sighash = sig[off] as i32;
+    Some(sighash)
+}
+
+#[cfg(test)]
+mod tests_der {
+    use super::parse_der_sighash;
+
+    // Helper to build a minimal DER with given R,S and sighash
+    fn der_sig(r: &[u8], s: &[u8], sighash: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(0x30);
+        let total_len = 2 + r.len() + 2 + s.len(); // (0x02,rlen,r) + (0x02,slen,s)
+        out.push(total_len as u8);
+        out.push(0x02);
+        out.push(r.len() as u8);
+        out.extend_from_slice(r);
+        out.push(0x02);
+        out.push(s.len() as u8);
+        out.extend_from_slice(s);
+        out.push(sighash);
+        out
+    }
+
+    #[test]
+    fn der_sighash_valid_minimal() {
+        // Minimal R,S (no leading zeros)
+        let r = vec![0x01, 0x02, 0x03];
+        let s = vec![0x04, 0x05, 0x06];
+        let sig = der_sig(&r, &s, 0x01);
+        assert_eq!(parse_der_sighash(&sig), Some(0x01));
+    }
+
+    #[test]
+    fn der_sighash_leading_zero_not_minimal() {
+        // Leading zero not required (next byte MSB not set) => invalid minimal encoding
+        let r = vec![0x00, 0x7f];
+        let s = vec![0x01];
+        let sig = der_sig(&r, &s, 0x01);
+        assert_eq!(parse_der_sighash(&sig), None);
+    }
+
+    #[test]
+    fn der_sighash_requires_leading_zero_ok() {
+        // Leading zero required because next byte MSB is set
+        let r = vec![0x00, 0x80];
+        let s = vec![0x00, 0x80];
+        let sig = der_sig(&r, &s, 0x81);
+        assert_eq!(parse_der_sighash(&sig), Some(0x81));
+    }
+
+    #[test]
+    fn der_sighash_wrong_total_len() {
+        // Corrupt total length (make total_len too small)
+        let mut sig = der_sig(&[0x01], &[0x02], 0x01);
+        sig[1] = sig[1].saturating_sub(1);
+        assert_eq!(parse_der_sighash(&sig), None);
+    }
+
+    #[test]
+    fn der_sighash_not_der() {
+        let sig = vec![0x31, 0x00, 0xff];
+        assert_eq!(parse_der_sighash(&sig), None);
+    }
+}
 
 /// Multiple-value INSERT SQL query formatter
 ///
@@ -915,7 +1053,33 @@ fn commit_atomic_bulk_insert_sql(
     let start = Instant::now();
     for (i, s) in queries.enumerate() {
         trace_time(
-            || Ok(transaction.batch_execute(&s)?),
+            || {
+                match transaction.batch_execute(&s) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // Include a small snippet of the SQL for easier diagnostics
+                        let snippet: String = s.chars().take(256).collect();
+                        if let Some(dbe) = e.as_db_error() {
+                            error!(
+                                "Postgres error on batch {} query {}: {} (code: {:?}, detail: {:?}, hint: {:?}); sql(first 256): {}",
+                                batch_id,
+                                i,
+                                dbe.message(),
+                                dbe.code(),
+                                dbe.detail(),
+                                dbe.hint(),
+                                snippet
+                            );
+                        } else {
+                            error!(
+                                "Postgres error on batch {} query {}: {}; sql(first 256): {}",
+                                batch_id, i, e, snippet
+                            );
+                        }
+                        Err(e.into())
+                    }
+                }
+            },
             |duration, _| {
                 debug!(
                     "Executed query {} of batch {} in {}ms",
@@ -957,7 +1121,11 @@ where
     move || {
         let res = f();
         if let Err(ref e) = res {
-            error!("{} finished with an error: {}", name, e);
+            error!(
+                "{} finished with an error: {}",
+                name,
+                e.display_causes_and_backtrace()
+            );
         }
 
         res
@@ -1089,7 +1257,298 @@ fn fmt_insert_blockdata_sql(
         |duration, _| debug!("Formatted queries in {}ms", duration.as_millis()),
     )?;
 
-    Ok(vec![event_q, block_q, block_tx_q, tx_q, output_q, input_q])
+    // Build output_meta batched insert (append-only, idempotent)
+    let mut output_meta_q = String::new();
+    let mut output_meta_fmt = MultiValueSqlFormatter::new_on_conflict_do_nothing(
+        &mut output_meta_q,
+        "INSERT INTO output_meta(block_hash_id, tx_hash_id, tx_idx, spk_type, witness_version, witness_program_len, is_taproot, taproot_xonly_pubkey, op_return_payload) VALUES",
+    );
+
+    for block in blocks {
+        for tx in block.data.txdata.iter() {
+            let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
+            for (vout, txout) in tx.output.iter().enumerate() {
+                // Script classification based on address::Payload (struct variant for WitnessProgram)
+                let (spk_type, wver_opt, wprog_len_opt, is_taproot_opt, xonly_opt) = {
+                    use bitcoin::util::address::{Payload, WitnessVersion};
+                    match Payload::from_script(&txout.script_pubkey) {
+                        Some(Payload::PubkeyHash(_)) => ("p2pkh", None, None, None, None),
+                        Some(Payload::ScriptHash(_)) => ("p2sh", None, None, None, None),
+                        Some(Payload::WitnessProgram { version, program }) => {
+                            let ver_num: i16 = match version {
+                                WitnessVersion::V0 => 0,
+                                WitnessVersion::V1 => 1,
+                                _ => 255,
+                            };
+                            let prog_len: i16 = program.len() as i16;
+                            if ver_num == 1 && program.len() == 32 {
+                                (
+                                    "p2tr",
+                                    Some(ver_num),
+                                    Some(prog_len),
+                                    Some(true),
+                                    Some(program.to_vec()),
+                                )
+                            } else if ver_num == 0 && program.len() == 20 {
+                                ("p2wpkh", Some(ver_num), Some(prog_len), None, None)
+                            } else if ver_num == 0 && program.len() == 32 {
+                                ("p2wsh", Some(ver_num), Some(prog_len), None, None)
+                            } else {
+                                ("witness", Some(ver_num), Some(prog_len), None, None)
+                            }
+                        }
+                        None => ("nonstandard", None, None, None, None),
+                    }
+                };
+
+                output_meta_fmt.fmt_with(|s| {
+                    // block_hash_id
+                    s.write_str("('\\x").unwrap();
+                    write_hash_id_hex(s, &block.id.as_hash()).unwrap();
+                    // tx_hash_id
+                    s.write_str("'::bytea,'\\x").unwrap();
+                    write_hash_id_hex(s, &tx_id.as_hash()).unwrap();
+                    // tx_idx
+                    s.write_fmt(format_args!("'::bytea,{}", vout)).unwrap();
+                    // spk_type
+                    s.write_fmt(format_args!(",'{}'", spk_type)).unwrap();
+                    // witness_version
+                    if let Some(v) = wver_opt {
+                        s.write_fmt(format_args!(",{}", v)).unwrap();
+                    } else {
+                        s.write_str(",NULL").unwrap();
+                    }
+                    // witness_program_len
+                    if let Some(l) = wprog_len_opt {
+                        s.write_fmt(format_args!(",{}", l)).unwrap();
+                    } else {
+                        s.write_str(",NULL").unwrap();
+                    }
+                    // is_taproot
+                    if let Some(true) = is_taproot_opt {
+                        s.write_str(",true").unwrap();
+                    } else {
+                        s.write_str(",NULL").unwrap();
+                    }
+                    // taproot_xonly_pubkey
+                    if let Some(prog) = xonly_opt {
+                        s.write_str(",'\\x").unwrap();
+                        write_hex(s, &prog).unwrap();
+                        s.write_str("'::bytea").unwrap();
+                    } else {
+                        s.write_str(",NULL").unwrap();
+                    }
+                    // op_return_payload (extract for OP_RETURN if present)
+                    {
+                        use bitcoin::blockdata::opcodes::all::OP_RETURN;
+                        let spk = &txout.script_pubkey;
+                        let spk_bytes = spk.as_bytes();
+                        if !spk_bytes.is_empty() && spk_bytes[0] == OP_RETURN.into_u8() {
+                            // Naive payload extraction: bytes after OP_RETURN and push opcode(s)
+                            // Try to skip a single-byte push opcode if present, otherwise store the raw tail
+                            let mut payload_start = 1usize;
+                            if spk_bytes.len() > 1 {
+                                let push = spk_bytes[1] as usize;
+                                // minimal support for small immediate push (<=75 bytes)
+                                if push <= 75 && spk_bytes.len() >= 2 + push {
+                                    payload_start = 2;
+                                }
+                            }
+                            let payload = &spk_bytes[payload_start..];
+                            s.write_str(",'\\x").unwrap();
+                            write_hex(s, payload).unwrap();
+                            s.write_str("'::bytea)").unwrap();
+                        } else {
+                            s.write_str(",NULL)").unwrap();
+                        }
+                    }
+                });
+            }
+        }
+    }
+    drop(output_meta_fmt);
+
+    // Insert revealed scripts first (append-only)
+    let mut script_q = String::new();
+    let mut script_fmt = MultiValueSqlFormatter::new_on_conflict_do_nothing(
+        &mut script_q,
+        "INSERT INTO script(id, script_hex, size, summary) VALUES",
+    );
+
+    // Then input_reveals, referencing scripts where applicable (append-only)
+    let mut input_reveals_q = String::new();
+    let mut input_reveals_fmt = MultiValueSqlFormatter::new_on_conflict_do_nothing(
+        &mut input_reveals_q,
+        "INSERT INTO input_reveals(block_hash_id, tx_hash_id, input_idx, output_tx_hash_id, output_tx_idx, redeem_script_id, witness_script_id, taproot_leaf_script_id, taproot_control_block, annex_present, sighash_flags) VALUES",
+    );
+
+    for block in blocks {
+        for tx in block.data.txdata.iter() {
+            let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
+            if tx.is_coin_base() {
+                // Skip coinbase: previous_output is invalid (vout can be 0xffffffff)
+                continue;
+            }
+            for (iidx, input) in tx.input.iter().enumerate() {
+                // Extract witness/leaf/control for segwit/taproot
+                let mut script_bytes_opt: Option<Vec<u8>> = None;
+                let mut taproot_control_opt: Option<Vec<u8>> = None;
+                let mut annex_present_opt: Option<bool> = None;
+                let mut sighash_flags_opt: Option<i32> = None;
+                if !input.witness.is_empty() {
+                    let w: Vec<&[u8]> = input.witness.iter().collect();
+                    let wlen = w.len();
+                    // Annex is present if the first stack item starts with 0x50 (per BIP-342)
+                    if let Some(first) = w.get(0) {
+                        if !first.is_empty() && first[0] == 0x50 {
+                            annex_present_opt = Some(true);
+                        }
+                    }
+                    // Try to derive sighash flags from any DER-encoded signature in the witness
+                    for elm in &w {
+                        if let Some(v) = parse_der_sighash(elm) {
+                            sighash_flags_opt = Some(v);
+                            break;
+                        }
+                    }
+                    if wlen >= 2 {
+                        // Heuristic: last is control block (taproot script path), second last is leaf script
+                        let leaf_script = &w[wlen - 2];
+                        let control_block = &w[wlen - 1];
+                        if !leaf_script.is_empty() {
+                            script_bytes_opt = Some(leaf_script.to_vec());
+                        }
+                        if !control_block.is_empty() {
+                            taproot_control_opt = Some(control_block.to_vec());
+                        }
+                    } else if let Some(last) = w.last() {
+                        if !last.is_empty() {
+                            // Single-item witness: likely a WPKH witness; no script to record here
+                            script_bytes_opt = None;
+                        }
+                    }
+                }
+
+                // Extract potential P2SH redeemScript from scriptSig: take the last push bytes if any
+                let mut redeem_script_bytes_opt: Option<Vec<u8>> = None;
+                for instr in input.script_sig.instructions() {
+                    if let Ok(bitcoin::blockdata::script::Instruction::PushBytes(b)) = instr {
+                        // If this push is a DER-encoded signature with trailing sighash, record it
+                        if sighash_flags_opt.is_none() {
+                            if let Some(v) = parse_der_sighash(b) {
+                                sighash_flags_opt = Some(v);
+                            }
+                        }
+                        redeem_script_bytes_opt = Some(b.to_vec());
+                    }
+                }
+                let mut redeem_script_hash_bytes: Option<Vec<u8>> = None;
+                if let Some(ref rs_bytes) = redeem_script_bytes_opt {
+                    let h = bitcoin::hashes::sha256::Hash::hash(&rs_bytes[..]);
+                    let inner = h.into_inner();
+                    redeem_script_hash_bytes = Some(inner.to_vec());
+                    script_fmt.fmt_with(|s| {
+                        s.write_str("('\\x").unwrap();
+                        s.write_str(&hex::encode(&inner[..])).unwrap();
+                        s.write_str("'::bytea,'").unwrap();
+                        s.write_str(&hex::encode(&rs_bytes[..])).unwrap();
+                        s.write_str("',").unwrap();
+                        s.write_fmt(format_args!("{}", rs_bytes.len())).unwrap();
+                        s.write_str(",NULL)").unwrap();
+                    });
+                }
+
+                let mut script_hash_bytes: Option<Vec<u8>> = None;
+                if let Some(ref script_bytes) = script_bytes_opt {
+                    let h = bitcoin::hashes::sha256::Hash::hash(&script_bytes);
+                    let inner = h.into_inner();
+                    script_hash_bytes = Some(inner.to_vec());
+                    script_fmt.fmt_with(|s| {
+                        s.write_str("('\\x").unwrap();
+                        s.write_str(&hex::encode(&inner[..])).unwrap();
+                        s.write_str("'::bytea,'").unwrap();
+                        s.write_str(&hex::encode(&script_bytes[..])).unwrap();
+                        s.write_str("',").unwrap();
+                        s.write_fmt(format_args!("{}", script_bytes.len())).unwrap();
+                        s.write_str(",NULL)").unwrap();
+                    });
+                }
+
+                // Skip if vout doesn't fit into INT column (e.g., coinbase 0xffffffff)
+                if input.previous_output.vout > i32::MAX as u32 {
+                    continue;
+                }
+                input_reveals_fmt.fmt_with(|s| {
+                    // block_hash_id
+                    s.write_str("('\\x").unwrap();
+                    write_hash_id_hex(s, &block.id.as_hash()).unwrap();
+                    // tx_hash_id
+                    s.write_str("'::bytea,'\\x").unwrap();
+                    write_hash_id_hex(s, &tx_id.as_hash()).unwrap();
+                    // input_idx
+                    s.write_fmt(format_args!("'::bytea,{}", iidx)).unwrap();
+                    // output_tx_hash_id
+                    s.write_str(",'\\x").unwrap();
+                    write_hash_id_hex(s, &input.previous_output.txid.as_hash()).unwrap();
+                    // output_tx_idx
+                    s.write_fmt(format_args!("'::bytea,{}", input.previous_output.vout))
+                        .unwrap();
+                    // redeem_script_id
+                    if let Some(ref hbytes) = redeem_script_hash_bytes {
+                        s.write_str(",'\\x").unwrap();
+                        s.write_str(&hex::encode(&hbytes[..])).unwrap();
+                        s.write_str("'::bytea").unwrap();
+                    } else {
+                        s.write_str(",NULL").unwrap();
+                    }
+                    // witness_script_id
+                    if let Some(ref hbytes) = script_hash_bytes {
+                        s.write_str(",'\\x").unwrap();
+                        s.write_str(&hex::encode(&hbytes[..])).unwrap();
+                        s.write_str("'::bytea").unwrap();
+                    } else {
+                        s.write_str(",NULL").unwrap();
+                    }
+                    // taproot_leaf_script_id
+                    s.write_str(",NULL").unwrap();
+                    // taproot_control_block
+                    if let Some(ref ctrl) = taproot_control_opt {
+                        s.write_str(",'\\x").unwrap();
+                        write_hex(s, &ctrl[..]).unwrap();
+                        s.write_str("'::bytea").unwrap();
+                    } else {
+                        s.write_str(",NULL").unwrap();
+                    }
+                    // annex_present
+                    if let Some(true) = annex_present_opt {
+                        s.write_str(",true").unwrap();
+                    } else {
+                        s.write_str(",NULL").unwrap();
+                    }
+                    // sighash_flags
+                    if let Some(v) = sighash_flags_opt {
+                        s.write_fmt(format_args!(",{})", v)).unwrap();
+                    } else {
+                        s.write_str(",NULL)").unwrap();
+                    }
+                });
+            }
+        }
+    }
+    drop(script_fmt);
+    drop(input_reveals_fmt);
+
+    Ok(vec![
+        event_q,
+        block_q,
+        block_tx_q,
+        tx_q,
+        output_q,
+        input_q,
+        script_q,
+        input_reveals_q,
+        output_meta_q,
+    ])
 }
 impl AsyncBlockInsertWorker {
     fn new(
@@ -1127,9 +1586,10 @@ impl AsyncBlockInsertWorker {
                     let inputs_utxo_map =
                         utxo_set_cache.process_blocks(&mut conn, &blocks, &tx_ids)?;
 
-                    query_fmt_tx
-                        .send((batch_id, blocks, inputs_utxo_map, tx_ids))
-                        .expect("Send not fail");
+                    if let Err(e) = query_fmt_tx.send((batch_id, blocks, inputs_utxo_map, tx_ids)) {
+                        error!("pg_utxo_fetching: downstream channel closed: {}", e);
+                        break;
+                    }
                 }
                 Ok(())
             })
@@ -1152,15 +1612,16 @@ impl AsyncBlockInsertWorker {
 
                     let block_ids = blocks.into_iter().map(|block| block.id).collect();
 
-                    writer_tx
-                        .send((
-                            batch_id,
-                            insert_queries,
-                            block_ids,
-                            max_block_height,
-                            tx_len,
-                        ))
-                        .expect("Send not fail");
+                    if let Err(e) = writer_tx.send((
+                        batch_id,
+                        insert_queries,
+                        block_ids,
+                        max_block_height,
+                        tx_len,
+                    )) {
+                        error!("pg_query_fmt: downstream channel closed: {}", e);
+                        break;
+                    }
                 }
                 Ok(())
             })
@@ -1223,18 +1684,32 @@ impl AsyncBlockInsertWorker {
 
 impl Drop for AsyncBlockInsertWorker {
     fn drop(&mut self) {
+        // Close channel to signal shutdown
         drop(self.tx.take());
 
-        let joins = vec![
-            self.utxo_fetching_thread.take().unwrap(),
-            self.query_fmt_thread.take().unwrap(),
-            self.writer_thread.take().unwrap(),
+        // Attempt to join threads gracefully; log errors, don't panic
+        let handles = [
+            self.utxo_fetching_thread.take(),
+            self.query_fmt_thread.take(),
+            self.writer_thread.take(),
         ];
 
-        for join in joins {
-            join.join()
-                .expect("Couldn't join on thread")
-                .expect("Worker thread panicked");
+        for handle_opt in handles {
+            if let Some(handle) = handle_opt {
+                match handle.join() {
+                    Ok(res) => {
+                        if let Err(e) = res {
+                            error!(
+                                "Worker thread finished with error during shutdown: {}",
+                                e.display_causes_and_backtrace()
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        error!("Worker thread panicked during shutdown");
+                    }
+                }
+            }
         }
     }
 }
@@ -1246,6 +1721,8 @@ pub struct IndexerStore {
     batch: Vec<crate::BlockData>,
     batch_txs_total: u64,
     batch_id: u64,
+    bulk_flush_txs_threshold: u64,
+    bulk_flush_blocks_threshold: usize,
     mode: Mode,
     network: bitcoin::Network,
     node_chain_head_height: BlockHeight,
@@ -1279,11 +1756,47 @@ impl IndexerStore {
         let mode = Self::read_indexer_state(&mut connection)?;
         let chain_block_count = Self::read_db_chain_block_count(&mut connection)?;
         let chain_current_block_count = Self::read_db_chain_current_block_count(&mut connection)?;
+        if chain_current_block_count > 0 {
+            if let Some(db_head_hash) =
+                Self::read_db_block_hash_by_height(&mut connection, chain_current_block_count - 1)?
+            {
+                info!(
+                    "DB head at {}H: {} (chain_block_count={}, current_block_count={}, mode={})",
+                    chain_current_block_count - 1,
+                    db_head_hash,
+                    chain_block_count,
+                    chain_current_block_count,
+                    mode
+                );
+            } else {
+                info!(
+                    "DB head unknown at {}H (chain_block_count={}, current_block_count={}, mode={})",
+                    chain_current_block_count - 1,
+                    chain_block_count,
+                    chain_current_block_count,
+                    mode
+                );
+            }
+        } else {
+            info!(
+                "DB empty (chain_block_count={}, current_block_count={}, mode={})",
+                chain_block_count, chain_current_block_count, mode
+            );
+        }
 
         assert_eq!(
             chain_block_count, chain_current_block_count,
             "db is supposed to preserve reorg atomicity"
         );
+        // Configurable bulk flush thresholds
+        let bulk_flush_txs_threshold = std::env::var("INDEXER_BULK_FLUSH_TXS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(100_000);
+        let bulk_flush_blocks_threshold = std::env::var("INDEXER_BULK_FLUSH_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1000);
         let mut s = IndexerStore {
             url,
             connection,
@@ -1291,6 +1804,8 @@ impl IndexerStore {
             batch: vec![],
             batch_txs_total: 0,
             batch_id: 0,
+            bulk_flush_txs_threshold,
+            bulk_flush_blocks_threshold,
             mode,
             network,
             node_chain_head_height,
@@ -1299,7 +1814,11 @@ impl IndexerStore {
             chain_block_count,
         };
         if s.mode == Mode::FreshBulk {
-            s.self_test()?;
+            if std::env::var("INDEXER_SELF_TEST").ok().as_deref() == Some("1") {
+                s.self_test()?;
+            } else {
+                trace!("Skipping self-test (set INDEXER_SELF_TEST=1 to enable)");
+            }
         }
         s.set_schema_to_mode(s.mode)?;
         s.start_workers();
@@ -1394,14 +1913,73 @@ impl IndexerStore {
         }
     }
 
+    fn batch_execute_with_log(conn: &mut pg::Client, sql: &str, context: &str) -> Result<()> {
+        match conn.batch_execute(sql) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let snippet: String = sql.chars().take(256).collect();
+                if let Some(dbe) = e.as_db_error() {
+                    error!(
+                        "Postgres {} error: {} (code: {:?}, detail: {:?}, hint: {:?}); sql(first 256): {}",
+                        context,
+                        dbe.message(),
+                        dbe.code(),
+                        dbe.detail(),
+                        dbe.hint(),
+                        snippet
+                    );
+                } else {
+                    error!(
+                        "Postgres {} error: {}; sql(first 256): {}",
+                        context, e, snippet
+                    );
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    fn execute_with_log(
+        conn: &mut pg::Client,
+        sql: &str,
+        params: &[&(dyn pg::ToSql + Sync)],
+        context: &str,
+    ) -> Result<u64> {
+        match conn.execute(sql, params) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                if let Some(dbe) = e.as_db_error() {
+                    error!(
+                        "Postgres {} error: {} (code: {:?}, detail: {:?}, hint: {:?}); sql: {}",
+                        context,
+                        dbe.message(),
+                        dbe.code(),
+                        dbe.detail(),
+                        dbe.hint(),
+                        sql
+                    );
+                } else {
+                    error!("Postgres {} error: {}; sql: {}", context, e, sql);
+                }
+                Err(e.into())
+            }
+        }
+    }
+
     fn init(conn: &mut pg::Client) -> Result<()> {
         info!("Creating initial db schema");
-        conn.batch_execute(include_str!("pg/init.sql"))?;
+        Self::batch_execute_with_log(conn, include_str!("pg/init.sql"), "init")?;
         Ok(())
     }
 
     fn stop_workers(&mut self) {
         debug!("Stopping DB pipeline workers");
+        // Best-effort flush any pending batch before stopping the pipeline
+        if !self.batch.is_empty() {
+            if let Err(e) = self.flush_batch() {
+                error!("Failed to flush final batch before stopping workers: {}", e);
+            }
+        }
         self.pipeline.take();
         debug!("Stopped DB pipeline workers");
         assert!(self.in_flight.lock().unwrap().is_empty());
@@ -1455,14 +2033,26 @@ impl IndexerStore {
         }
         drop(in_flight);
 
-        self.pipeline
-            .as_ref()
-            .expect("workers running")
-            .tx
-            .as_ref()
-            .expect("tx not null")
-            .send((self.batch_id, batch))
-            .expect("Send should not fail");
+        if let Some(pipeline) = self.pipeline.as_ref() {
+            if let Some(tx) = pipeline.tx.as_ref() {
+                if let Err(e) = tx.send((self.batch_id, batch)) {
+                    error!("Failed to queue batch {} to pipeline: {}", self.batch_id, e);
+                    bail!(
+                        "pipeline channel closed while sending batch {}",
+                        self.batch_id
+                    );
+                }
+            } else {
+                error!(
+                    "Pipeline sender missing when flushing batch {}",
+                    self.batch_id
+                );
+                bail!("pipeline sender missing");
+            }
+        } else {
+            error!("Pipeline not running when flushing batch {}", self.batch_id);
+            bail!("pipeline not running");
+        }
         trace!("Batch flushed");
         self.batch_txs_total = 0;
         self.batch_id += 1;
@@ -1487,7 +2077,11 @@ impl IndexerStore {
 
     fn set_schema_to_mode(&mut self, mode: Mode) -> Result<()> {
         info!("Adjusting schema to mode: {}", mode);
-        self.connection.batch_execute(mode.to_sql_query_str())?;
+        Self::batch_execute_with_log(
+            &mut self.connection,
+            mode.to_sql_query_str(),
+            "set_schema_to_mode",
+        )?;
         Ok(())
     }
 
@@ -1499,9 +2093,11 @@ impl IndexerStore {
 
         self.set_schema_to_mode(mode)?;
         // commit to the new mode in the db last
-        self.connection.execute(
+        Self::execute_with_log(
+            &mut self.connection,
             "UPDATE indexer_state SET bulk_mode = $1",
             &[&(mode.is_bulk())],
+            "set_mode_uncodintionally:update_indexer_state",
         )?;
         Ok(())
     }
@@ -1539,24 +2135,21 @@ impl IndexerStore {
 
         // we're not extending ... reorg start or something we already have
         if block.height != self.chain_block_count {
-            // workers expect state of tables not to change while they are running
-            // they need to be stopped
+            // flush any pending batch to keep state consistent before checking db
             self.flush_batch()?;
-            self.stop_workers();
 
+            // fetch current db hash at this height without stopping workers yet
             let db_hash = Self::read_db_block_hash_by_height(&mut self.connection, block.height)?
                 .expect("Block at this height should already by indexed");
 
             if db_hash == block.id {
-                // we already have exact same block, non-extinct, and we don't want
-                // to add it twice
+                // already included; avoid stop/start thrash
                 trace!("Already included block {}H {}", block.height, block.id);
-                self.start_workers();
-
                 return Ok(());
             }
 
-            // we're starting a reorg
+            // reorg: now stop workers because schema/table state will change
+            self.stop_workers();
 
             info!(
                 "Node block != db block at {}H; {} != {} - reorg",
@@ -1578,7 +2171,9 @@ impl IndexerStore {
         self.chain_block_count += 1;
 
         if self.mode.is_bulk() {
-            if self.batch_txs_total > 100_000 {
+            if self.batch_txs_total >= self.bulk_flush_txs_threshold
+                || self.batch.len() >= self.bulk_flush_blocks_threshold
+            {
                 self.flush_batch()?;
             }
         } else {
@@ -1824,11 +2419,20 @@ impl super::IndexerStore for IndexerStore {
             return Ok(Some(block.id));
         }
 
-        // TODO: This could be done better, if we were just tracking
-        // things in flight better
-        self.flush_workers()?;
+        // Only flush workers if there is pending work to avoid startup thrash
+        if !self.batch.is_empty() || !self.in_flight.lock().unwrap().is_empty() {
+            self.flush_workers()?;
+        }
 
-        Self::read_db_block_hash_by_height(&mut self.connection, height)
+        {
+            let res = Self::read_db_block_hash_by_height(&mut self.connection, height)?;
+            if let Some(ref h) = res {
+                info!("Resume probe: DB hash at {}H is {}", height, h);
+            } else {
+                info!("Resume probe: no DB hash at {}H", height);
+            }
+            Ok(res)
+        }
     }
 
     fn insert(&mut self, block: crate::BlockData) -> Result<()> {
