@@ -1394,17 +1394,10 @@ fn fmt_insert_blockdata_sql(
     let mut input_reveals_q = String::new();
     let mut input_reveals_fmt = MultiValueSqlFormatter::new_on_conflict_do_nothing(
         &mut input_reveals_q,
-        "INSERT INTO input_reveals(block_hash_id, tx_hash_id, input_idx, output_tx_hash_id, output_tx_idx, redeem_script_id, witness_script_id, taproot_leaf_script_id, taproot_control_block, annex_present, sighash_flags) VALUES",
+        "INSERT INTO input_reveals(block_hash_id, tx_hash_id, input_idx, output_tx_hash_id, output_tx_idx, redeem_script_id, witness_script_id, taproot_leaf_script_id, taproot_control_block, annex_present, sighash_flags, is_taproot_key_spend, schnorr_sig_count) VALUES",
     );
 
-    let do_spend_reveals = std::env::var("INDEX_SPEND_REVEALS")
-        .ok()
-        .map(|v| {
-            let s = v.trim().to_ascii_lowercase();
-            s == "1" || s == "true" || s == "yes" || s == "on"
-        })
-        .unwrap_or(false);
-    if do_spend_reveals {
+    if true {
         for block in blocks {
             for tx in block.data.txdata.iter() {
                 let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
@@ -1418,6 +1411,8 @@ fn fmt_insert_blockdata_sql(
                     let mut taproot_control_opt: Option<Vec<u8>> = None;
                     let mut annex_present_opt: Option<bool> = None;
                     let mut sighash_flags_opt: Option<i32> = None;
+                    let mut is_taproot_key_spend_opt: Option<bool> = None;
+                    let mut schnorr_sig_count_opt: Option<i32> = None;
                     if !input.witness.is_empty() {
                         let w: Vec<&[u8]> = input.witness.iter().collect();
                         let wlen = w.len();
@@ -1427,12 +1422,22 @@ fn fmt_insert_blockdata_sql(
                                 annex_present_opt = Some(true);
                             }
                         }
-                        // Try to derive sighash flags from any DER-encoded signature in the witness
+                        // Count schnorr sigs and derive sighash flags from any DER-encoded signature
+                        let mut schnorr_count_local = 0;
                         for elm in &w {
-                            if let Some(v) = parse_der_sighash(elm) {
-                                sighash_flags_opt = Some(v);
-                                break;
+                            if parse_der_sighash(elm).is_none() {
+                                let len = elm.len();
+                                if len == 64 || len == 65 {
+                                    schnorr_count_local += 1;
+                                }
+                            } else if sighash_flags_opt.is_none() {
+                                if let Some(v) = parse_der_sighash(elm) {
+                                    sighash_flags_opt = Some(v);
+                                }
                             }
+                        }
+                        if schnorr_count_local > 0 {
+                            schnorr_sig_count_opt = Some(schnorr_count_local as i32);
                         }
                         if wlen >= 2 {
                             // Heuristic: last is control block (taproot script path), second last is leaf script
@@ -1449,6 +1454,12 @@ fn fmt_insert_blockdata_sql(
                                 // Single-item witness: likely a WPKH witness; no script to record here
                                 script_bytes_opt = None;
                             }
+                        }
+                        // Infer taproot key vs script spend
+                        if taproot_control_opt.is_some() {
+                            is_taproot_key_spend_opt = Some(false);
+                        } else if schnorr_sig_count_opt.unwrap_or(0) > 0 {
+                            is_taproot_key_spend_opt = Some(true);
                         }
                     }
 
@@ -1550,6 +1561,22 @@ fn fmt_insert_blockdata_sql(
                         }
                         // sighash_flags
                         if let Some(v) = sighash_flags_opt {
+                            s.write_fmt(format_args!(",{}", v)).unwrap();
+                        } else {
+                            s.write_str(",NULL").unwrap();
+                        }
+                        // is_taproot_key_spend
+                        if let Some(v) = is_taproot_key_spend_opt {
+                            if v {
+                                s.write_str(",true").unwrap();
+                            } else {
+                                s.write_str(",false").unwrap();
+                            }
+                        } else {
+                            s.write_str(",NULL").unwrap();
+                        }
+                        // schnorr_sig_count
+                        if let Some(v) = schnorr_sig_count_opt {
                             s.write_fmt(format_args!(",{})", v)).unwrap();
                         } else {
                             s.write_str(",NULL)").unwrap();
@@ -2204,6 +2231,20 @@ impl IndexerStore {
             &mut self.connection,
             base_ddl,
             "set_schema_to_mode:stage4_base",
+        )?;
+
+        // Stage 8 incremental columns (idempotent)
+        let alter_stage8 = r#"
+        ALTER TABLE input_reveals
+          ADD COLUMN IF NOT EXISTS is_taproot_key_spend BOOLEAN NULL;
+        ALTER TABLE input_reveals
+          ADD COLUMN IF NOT EXISTS schnorr_sig_count INT NULL;
+        "#;
+
+        Self::batch_execute_with_log(
+            &mut self.connection,
+            alter_stage8,
+            "set_schema_to_mode:stage8_alter",
         )?;
 
         // In Normal mode, create ergonomic views and selective indices to support analytics.
