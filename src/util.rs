@@ -1,4 +1,5 @@
 pub mod bitcoin;
+pub mod script;
 
 use log::info;
 use std::time::{Duration, Instant};
