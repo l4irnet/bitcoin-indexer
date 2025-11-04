@@ -521,6 +521,23 @@ impl<'a> OutputFormatter<'a> {
 
     fn fmt(&mut self, tx_id: &Sha256dHash, output: &bitcoin::TxOut, vout: u32) {
         let network = self.network;
+
+        // Optional logging/metrics for script classification behind INDEX_SCRIPTS toggle
+        if crate::util::script::is_enabled() {
+            if let Some(meta) = crate::util::script::classify_if_enabled(&output.script_pubkey) {
+                debug!(
+                    "INDEX_SCRIPTS: tx_id={:?} vout={} spk_type={:?} wver={:?} wlen={:?} is_taproot={} opret_len={}",
+                    tx_id,
+                    vout,
+                    meta.spk_type,
+                    meta.witness_version,
+                    meta.witness_program_len,
+                    meta.taproot_xonly_pubkey.is_some(),
+                    meta.op_return_payload.as_ref().map(|v| v.len()).unwrap_or(0)
+                );
+            }
+        }
+
         self.output.fmt_with(|s| {
             s.write_str("('\\x").unwrap();
             write_hash_id_hex(s, tx_id).unwrap();
@@ -1589,6 +1606,42 @@ impl AsyncBlockInsertWorker {
                         fmt_insert_blockdata_sql(&blocks, inputs_utxo_map, tx_ids, mode, network)?;
 
                     let tx_len = blocks.iter().map(|b| b.data.txdata.len()).sum();
+                    if crate::util::script::is_enabled() {
+                        // Batch-level metrics for script classification
+                        let mut total_outputs: usize = 0;
+                        let mut p2pkh = 0usize;
+                        let mut p2sh = 0usize;
+                        let mut p2wpkh = 0usize;
+                        let mut p2wsh = 0usize;
+                        let mut p2tr = 0usize;
+                        let mut op_return = 0usize;
+                        let mut witness = 0usize;
+                        let mut nonstandard = 0usize;
+                        for block in &blocks {
+                            for tx in block.data.txdata.iter() {
+                                for txout in tx.output.iter() {
+                                    total_outputs += 1;
+                                    let meta = crate::util::script::classify(&txout.script_pubkey);
+                                    match meta.spk_type {
+                                        crate::util::script::SpkType::P2PKH => p2pkh += 1,
+                                        crate::util::script::SpkType::P2SH => p2sh += 1,
+                                        crate::util::script::SpkType::P2WPKH => p2wpkh += 1,
+                                        crate::util::script::SpkType::P2WSH => p2wsh += 1,
+                                        crate::util::script::SpkType::P2TR => p2tr += 1,
+                                        crate::util::script::SpkType::OpReturn => op_return += 1,
+                                        crate::util::script::SpkType::Witness => witness += 1,
+                                        crate::util::script::SpkType::NonStandard => {
+                                            nonstandard += 1
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        info!(
+                            "INDEX_SCRIPTS: batch outputs={} p2pkh={} p2sh={} p2wpkh={} p2wsh={} p2tr={} op_return={} witness={} nonstandard={}",
+                            total_outputs, p2pkh, p2sh, p2wpkh, p2wsh, p2tr, op_return, witness, nonstandard
+                        );
+                    }
 
                     let max_block_height = blocks
                         .iter()
@@ -2064,11 +2117,132 @@ impl IndexerStore {
 
     fn set_schema_to_mode(&mut self, mode: Mode) -> Result<()> {
         info!("Adjusting schema to mode: {}", mode);
+
+        // Execute existing mode-specific schema adjustments
         Self::batch_execute_with_log(
             &mut self.connection,
             mode.to_sql_query_str(),
             "set_schema_to_mode",
         )?;
+
+        // Stage 4: Append-only DDL scaffolding (idempotent, safe in all modes)
+        // - Create new tables if they don't exist
+        // - Avoid heavy indices by default; add selective indices/views in Normal mode
+        let base_ddl = r#"
+        -- script: deduplicated scripts (append-only)
+        CREATE TABLE IF NOT EXISTS script (
+          id BYTEA PRIMARY KEY,          -- hash of script bytes (e.g., sha256)
+          script_hex TEXT NOT NULL,
+          size INT NOT NULL,
+          summary TEXT NULL
+        );
+
+        -- output_meta: per-output classification per originating block (append-only)
+        CREATE TABLE IF NOT EXISTS output_meta (
+          block_hash_id BYTEA NOT NULL,
+          tx_hash_id BYTEA NOT NULL,
+          tx_idx INT NOT NULL,
+          spk_type TEXT NOT NULL,
+          witness_version SMALLINT NULL,
+          witness_program_len SMALLINT NULL,
+          is_taproot BOOLEAN NULL,
+          taproot_xonly_pubkey BYTEA NULL,
+          op_return_payload BYTEA NULL,
+          PRIMARY KEY (block_hash_id, tx_hash_id, tx_idx)
+        );
+
+        -- input_reveals: spend-time script details (append-only)
+        CREATE TABLE IF NOT EXISTS input_reveals (
+          block_hash_id BYTEA NOT NULL,
+          tx_hash_id BYTEA NOT NULL,
+          input_idx INT NOT NULL,
+          output_tx_hash_id BYTEA NULL,
+          output_tx_idx INT NULL,
+          redeem_script_id BYTEA NULL,
+          witness_script_id BYTEA NULL,
+          taproot_leaf_script_id BYTEA NULL,
+          taproot_control_block BYTEA NULL,
+          annex_present BOOLEAN NULL,
+          sighash_flags INT NULL,
+          PRIMARY KEY (block_hash_id, tx_hash_id, input_idx)
+        );
+
+        -- script_features: optional parsed opcode/policy features keyed by script
+        CREATE TABLE IF NOT EXISTS script_features (
+          script_id BYTEA PRIMARY KEY,
+          has_cltv BOOLEAN NULL,
+          has_csv BOOLEAN NULL,
+          multisig_m SMALLINT NULL,
+          multisig_n SMALLINT NULL,
+          miniscript TEXT NULL
+        );
+        "#;
+
+        Self::batch_execute_with_log(
+            &mut self.connection,
+            base_ddl,
+            "set_schema_to_mode:stage4_base",
+        )?;
+
+        // In Normal mode, create ergonomic views and selective indices to support analytics.
+        if let Mode::Normal = mode {
+            let normal_ddl = r#"
+            -- Views to join non-extinct blocks with output/input metadata
+            CREATE OR REPLACE VIEW output_with_meta AS
+              SELECT
+                o.tx_hash_id,
+                o.tx_idx,
+                o.value,
+                om.spk_type,
+                om.witness_version,
+                om.witness_program_len,
+                om.is_taproot,
+                om.taproot_xonly_pubkey,
+                om.op_return_payload
+              FROM output AS o
+              JOIN block_tx AS bt ON bt.tx_hash_id = o.tx_hash_id
+              JOIN block AS b ON b.hash_id = bt.block_hash_id AND b.extinct = false
+              LEFT JOIN output_meta AS om
+                ON om.block_hash_id = b.hash_id
+               AND om.tx_hash_id = o.tx_hash_id
+               AND om.tx_idx = o.tx_idx;
+
+            CREATE OR REPLACE VIEW input_with_reveals AS
+              SELECT
+                i.tx_hash_id,
+                i.output_tx_hash_id,
+                i.output_tx_idx,
+                ir.redeem_script_id,
+                ir.witness_script_id,
+                ir.taproot_leaf_script_id,
+                ir.taproot_control_block,
+                ir.annex_present,
+                ir.sighash_flags
+              FROM input AS i
+              JOIN block_tx AS bt ON bt.tx_hash_id = i.tx_hash_id
+              JOIN block AS b ON b.hash_id = bt.block_hash_id AND b.extinct = false
+              LEFT JOIN input_reveals AS ir
+                ON ir.block_hash_id = b.hash_id
+               AND ir.tx_hash_id = i.tx_hash_id
+               AND ir.input_idx = (
+                 SELECT idx FROM (
+                   SELECT row_number() OVER () - 1 AS idx
+                 ) AS t WHERE idx = 0
+               );
+
+            -- Selective indices for frequent filters
+            CREATE INDEX IF NOT EXISTS idx_output_meta_spk_type ON output_meta (spk_type);
+            CREATE INDEX IF NOT EXISTS idx_output_meta_is_taproot ON output_meta (is_taproot);
+            CREATE INDEX IF NOT EXISTS idx_output_meta_wver ON output_meta (witness_version);
+            "#;
+
+            Self::batch_execute_with_log(
+                &mut self.connection,
+                normal_ddl,
+                "set_schema_to_mode:stage4_normal",
+            )?;
+        }
+
         Ok(())
     }
 
