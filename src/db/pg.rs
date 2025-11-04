@@ -1545,11 +1545,44 @@ fn fmt_insert_blockdata_sql(
                             let sb = bitcoin::ScriptBuf::from_bytes(rs_bytes.clone());
                             let (has_cltv, has_csv, multisig_m, multisig_n) =
                                 parse_script_features(sb.as_script());
-                            let miniscript_text_opt = miniscript::Miniscript::<bitcoin::PublicKey, miniscript::Legacy>::parse(sb.as_script())
-                                .map(|ms| ms.to_string())
-                                .or_else(|_| miniscript::Miniscript::<bitcoin::PublicKey, miniscript::Segwitv0>::parse(sb.as_script()).map(|ms| ms.to_string()))
-                                .or_else(|_| miniscript::Miniscript::<bitcoin::secp256k1::XOnlyPublicKey, miniscript::Tap>::parse(sb.as_script()).map(|ms| ms.to_string()))
-                                .ok();
+                            let mut miniscript_text_opt: Option<String> = None;
+                            let mut miniscript_ctx: Option<&'static str> = None;
+                            if let Ok(ms) = miniscript::Miniscript::<
+                                bitcoin::PublicKey,
+                                miniscript::Legacy,
+                            >::parse(sb.as_script())
+                            {
+                                miniscript_ctx = Some("legacy");
+                                miniscript_text_opt = Some(ms.to_string());
+                            } else if let Ok(ms) = miniscript::Miniscript::<
+                                bitcoin::PublicKey,
+                                miniscript::Segwitv0,
+                            >::parse(
+                                sb.as_script()
+                            ) {
+                                miniscript_ctx = Some("segwitv0");
+                                miniscript_text_opt = Some(ms.to_string());
+                            } else if let Ok(ms) =
+                                miniscript::Miniscript::<
+                                    bitcoin::secp256k1::XOnlyPublicKey,
+                                    miniscript::Tap,
+                                >::parse(sb.as_script())
+                            {
+                                miniscript_ctx = Some("tap");
+                                miniscript_text_opt = Some(ms.to_string());
+                            }
+                            if let Some(ctx) = miniscript_ctx {
+                                debug!(
+                                    "miniscript parse ok context={} script_id={}",
+                                    ctx,
+                                    hex::encode(&inner[..])
+                                );
+                            } else {
+                                debug!(
+                                    "miniscript parse failed script_id={}",
+                                    hex::encode(&inner[..])
+                                );
+                            }
                             script_features_fmt.fmt_with(|s| {
                                 s.write_str("('\\x").unwrap();
                                 s.write_str(&hex::encode(&inner[..])).unwrap();
@@ -1609,11 +1642,44 @@ fn fmt_insert_blockdata_sql(
                             let sb = bitcoin::ScriptBuf::from_bytes(script_bytes.clone());
                             let (has_cltv, has_csv, multisig_m, multisig_n) =
                                 parse_script_features(sb.as_script());
-                            let miniscript_text_opt = miniscript::Miniscript::<bitcoin::PublicKey, miniscript::Legacy>::parse(sb.as_script())
-                                .map(|ms| ms.to_string())
-                                .or_else(|_| miniscript::Miniscript::<bitcoin::PublicKey, miniscript::Segwitv0>::parse(sb.as_script()).map(|ms| ms.to_string()))
-                                .or_else(|_| miniscript::Miniscript::<bitcoin::secp256k1::XOnlyPublicKey, miniscript::Tap>::parse(sb.as_script()).map(|ms| ms.to_string()))
-                                .ok();
+                            let mut miniscript_text_opt: Option<String> = None;
+                            let mut miniscript_ctx: Option<&'static str> = None;
+                            if let Ok(ms) = miniscript::Miniscript::<
+                                bitcoin::PublicKey,
+                                miniscript::Legacy,
+                            >::parse(sb.as_script())
+                            {
+                                miniscript_ctx = Some("legacy");
+                                miniscript_text_opt = Some(ms.to_string());
+                            } else if let Ok(ms) = miniscript::Miniscript::<
+                                bitcoin::PublicKey,
+                                miniscript::Segwitv0,
+                            >::parse(
+                                sb.as_script()
+                            ) {
+                                miniscript_ctx = Some("segwitv0");
+                                miniscript_text_opt = Some(ms.to_string());
+                            } else if let Ok(ms) =
+                                miniscript::Miniscript::<
+                                    bitcoin::secp256k1::XOnlyPublicKey,
+                                    miniscript::Tap,
+                                >::parse(sb.as_script())
+                            {
+                                miniscript_ctx = Some("tap");
+                                miniscript_text_opt = Some(ms.to_string());
+                            }
+                            if let Some(ctx) = miniscript_ctx {
+                                debug!(
+                                    "miniscript parse ok context={} script_id={}",
+                                    ctx,
+                                    hex::encode(&inner[..])
+                                );
+                            } else {
+                                debug!(
+                                    "miniscript parse failed script_id={}",
+                                    hex::encode(&inner[..])
+                                );
+                            }
                             script_features_fmt.fmt_with(|s| {
                                 s.write_str("('\\x").unwrap();
                                 s.write_str(&hex::encode(&inner[..])).unwrap();
