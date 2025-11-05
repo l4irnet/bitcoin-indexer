@@ -2,40 +2,36 @@
 
 Status summary (Nov 2025)
 - Stage 1 — bitcoincore-rpc 0.19.x: DONE
-- Stage 2 — bitcoin 0.32.x (compat mode): IN PROGRESS (next)
-- Stage 3 — Script parsing utilities: PARTIAL (finish after Stage 2)
+- Stage 2 — bitcoin 0.32.x (compat mode): DONE
+- Stage 3 — Script parsing utilities: DONE
 - Stage 4 — Schema scaffolding (append-only): DONE
 - Stage 5 — Output classification write path: DONE
 - Stage 6 — Script registry population: DONE
 - Stage 7 — Witness/redeem/taproot extraction (incl. annex, control block, sighash flags): DONE
-- Stage 8 — Taproot key/script-spend + schnorr details: PARTIAL (add explicit flags/fields)
-- Stage 9 — Opcode/policy analytics (script_features population): PENDING
+- Stage 8 — Taproot key/script-spend + schnorr details: DONE
+- Stage 9 — Opcode/policy analytics (script_features population): DONE
 - Stage 10 — Views/indices (normal mode): DONE
-- Stage 11 — Backfill tool: PENDING
+- Stage 11 — Backfill tool: DE-SCOPED
 - Stage 12 — Cleanup/hardening: IN PROGRESS (better logging, robust shutdown, configurable flush)
 
-Immediate next steps (Stage 2: bitcoin 0.32.x upgrade)
-- Build and compile
-  - Update Cargo dependency to bitcoin = "0.32.x"
-  - Adapt APIs:
-    - Transaction: use compute_txid(); is_coinbase() (new spelling)
-    - Script types: switch to bitcoin::Script and bitcoin::ScriptBuf
-    - Address: Address::from_script(script, network) and addr.payload()
-    - Hash types: use associated Hash types from bitcoin_hashes (no as_hash/as_inner/into_inner)
-    - Amount/value: ensure correct integer types; avoid adding Amount to integers; convert explicitly
-    - Script parsing: iterate via script.instructions(); PushBytes in bitcoin::script::Instruction
-- Re-test and fix classification/extraction
-  - Output classification via Address::from_script; record witness version/program length; P2TR x-only program
-  - OP_RETURN parsing via script opcodes (keep heuristic lightweight)
-  - input_reveals: redeemScript (P2SH), witness/taproot leaf, control block, annex detection
-  - Sighash flags: keep robust DER+flag parser
-- Migration hygiene
-  - Keep all new writes append-only with ON CONFLICT DO NOTHING
-  - Maintain current bulk/normal mode behavior (no new FKs in bulk)
-  - Verify resume after crash (INDEXER_REWIND configurable)
+Immediate next steps (Ordinals, BRC-20, Runes — no backfill)
+- Schema additions (append-only)
+  - Add tables: inscription, brc20_event, runes_event
+  - Ensure input_reveals.taproot_leaf_script_id is populated for Taproot script-path spends
+  - Add minimal normal-mode indices/views to make exploration easy
+  - Introduce env toggles: INDEX_ORDINALS, INDEX_BRC20, INDEX_RUNES (optional: INDEX_INSCRIPTION_BODY=0 default)
+- Ordinals parser and writer
+  - Detect Ordinals inscription envelopes in Taproot leaf scripts (OP_FALSE OP_IF "ord" ... OP_ENDIF)
+  - Persist only metadata: content_type, body_sha256, body_size, plus location keys and parser_version
+  - Do not store the inscription body; it is reconstructible from witness or the script registry
+- BRC-20 event extraction
+  - For inscription JSON with p="brc-20", parse deploy/mint/transfer operations
+  - Store normalized fields (op, tick, decimals, amount/limit/max as raw strings) and optionally the original JSON as JSONB
+- Runes decoder and writer
+  - Decode OP_RETURN payloads into etchings and edicts; insert normalized rows
 - Validation
-  - Run end-to-end indexing over a small range; sanity-check views and counts
-  - Diff baseline vs new DB using the compare script/query approach
+  - Sanity-check parsing on known fixtures; ensure idempotent batched inserts
+  - Verify no performance regressions over a small range
 
 Follow-ups after Stage 2
 - Stage 3: finalize script parsing helpers (typed, unit-tested) on 0.32.x
@@ -386,5 +382,42 @@ Each PR: keep diffs focused, add tests where feasible, include brief performance
 - Be mindful of how additions interact with “bulk” vs “normal” modes. Avoid building heavy indices in bulk mode; prefer normal mode for analytical indices.
 - Prefer new append-only tables over modifying existing tables; avoid introducing new mutable columns.
 - For large backfills, consider maintenance windows and PG resource tuning.
+
+## Stages 13–17 — Ordinals, BRC-20, and Runes indexing (no backfill)
+
+### Stage 13 — Schema and plumbing (append-only)
+- Add DDL for:
+  - inscription(block_hash_id, tx_hash_id, input_idx, inscription_idx, taproot_leaf_script_id, content_type, body_sha256, body_size, parser_version)
+  - brc20_event(block_hash_id, tx_hash_id, input_idx, inscription_idx, op, tick, decimals, amount_raw, limit_raw, max_supply_raw, json)
+  - runes_event(block_hash_id, tx_hash_id, tx_idx, kind, seq, rune_name, rune_id, to_vout, amount_raw, divisibility, symbol, terms, raw)
+- Populate input_reveals.taproot_leaf_script_id for Taproot script-path spends (keep witness_script_id for segwit v0)
+- Add minimal normal-mode indices and convenience views
+- Feature toggles: INDEX_ORDINALS, INDEX_BRC20, INDEX_RUNES (default INDEX_INSCRIPTION_BODY=0)
+
+### Stage 14 — Ordinals envelope parser + writer
+- Parse Taproot leaf scripts for inscription envelopes; support multiple per input (inscription_idx)
+- Persist only content_type, body_sha256, body_size, and location keys; do not store bodies
+- Batched INSERT with ON CONFLICT DO NOTHING for idempotence
+
+### Stage 15 — BRC-20 extraction
+- For inscription bodies with p="brc-20", decode deploy/mint/transfer
+- Store normalized fields (op, tick, decimals, amount/limit/max as raw strings); optionally store original JSON as JSONB
+- Event-only logging (no token state derivation in indexer)
+
+### Stage 16 — Runes decoder + writer
+- Decode OP_RETURN payloads into etchings and edicts
+- Insert one row per etching and per edict; keep raw bytes for forward compatibility
+
+### Stage 17 — Views, indices, and tests
+- Add views joining inscription/brc20_event/runes_event with input/output/block
+- Add selective indices in normal mode
+- Integration tests on known fixtures; performance sanity checks
+
+## PR sequencing (additional stages)
+14. Stage 13 — Schema + plumbing for Ordinals/BRC-20/Runes
+15. Stage 14 — Ordinals parser + writer
+16. Stage 15 — BRC-20 event extraction
+17. Stage 16 — Runes decoder + writer
+18. Stage 17 — Views/indices/tests for Ordinals/BRC-20/Runes
 
 End of roadmap.

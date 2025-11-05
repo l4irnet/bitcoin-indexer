@@ -1,4 +1,5 @@
 pub mod bitcoin;
+pub mod runes;
 pub mod script;
 
 use log::info;

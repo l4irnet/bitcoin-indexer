@@ -2,6 +2,14 @@ DROP VIEW IF EXISTS output_with_meta;
 DROP VIEW IF EXISTS input_with_reveals;
 DROP VIEW IF EXISTS script_with_features;
 
+DROP VIEW IF EXISTS inscription_with_block;
+DROP VIEW IF EXISTS brc20_event_with_block;
+DROP VIEW IF EXISTS runes_event_with_block;
+
+DROP TABLE IF EXISTS runes_event CASCADE;
+DROP TABLE IF EXISTS brc20_event CASCADE;
+DROP TABLE IF EXISTS inscription CASCADE;
+
 DROP TABLE IF EXISTS script_features CASCADE;
 DROP TABLE IF EXISTS input_reveals CASCADE;
 DROP TABLE IF EXISTS output_meta CASCADE;

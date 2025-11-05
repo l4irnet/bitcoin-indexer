@@ -131,3 +131,52 @@ CREATE TABLE IF NOT EXISTS script_features (
     ON DELETE CASCADE
     DEFERRABLE INITIALLY DEFERRED
 );
+
+-- inscriptions derived from taproot script-path reveals (append-only)
+CREATE TABLE IF NOT EXISTS inscription (
+  block_hash_id BYTEA NOT NULL,
+  tx_hash_id BYTEA NOT NULL,
+  input_idx INT NOT NULL,
+  inscription_idx INT NOT NULL,
+  taproot_leaf_script_id BYTEA,
+  content_type TEXT,
+  body_sha256 BYTEA,
+  body_size INT NOT NULL,
+  parser_version SMALLINT,
+  PRIMARY KEY (block_hash_id, tx_hash_id, input_idx, inscription_idx)
+);
+
+-- brc-20 events derived from inscription bodies (append-only)
+CREATE TABLE IF NOT EXISTS brc20_event (
+  block_hash_id BYTEA NOT NULL,
+  tx_hash_id BYTEA NOT NULL,
+  input_idx INT NOT NULL,
+  inscription_idx INT NOT NULL,
+  op TEXT NOT NULL,
+  tick TEXT NOT NULL,
+  decimals SMALLINT,
+  amount_raw TEXT,
+  limit_raw TEXT,
+  max_supply_raw TEXT,
+  json JSONB,
+  PRIMARY KEY (block_hash_id, tx_hash_id, input_idx, inscription_idx)
+);
+
+-- runes events derived from OP_RETURN payloads (append-only)
+CREATE TABLE IF NOT EXISTS runes_event (
+  block_hash_id BYTEA NOT NULL,
+  tx_hash_id BYTEA NOT NULL,
+  tx_idx INT NOT NULL,      -- OP_RETURN output index
+  kind TEXT NOT NULL,       -- 'etching' | 'edict'
+  seq INT NOT NULL,         -- ordinal within payload
+  rune_name TEXT,
+  rune_id TEXT,
+  to_vout INT,
+  amount_raw TEXT,
+  divisibility SMALLINT,
+  symbol TEXT,
+  terms JSONB,
+  pointer INT,
+  raw BYTEA NOT NULL,
+  PRIMARY KEY (block_hash_id, tx_hash_id, tx_idx, kind, seq)
+);

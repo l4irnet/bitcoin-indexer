@@ -77,6 +77,335 @@ fn parse_script_features(script: &bitcoin::Script) -> (bool, bool, Option<i32>, 
     (has_cltv, has_csv, m_opt, n_opt)
 }
 
+fn parse_ordinals_inscriptions(leaf_script: &[u8]) -> Vec<(Option<String>, [u8; 32], usize)> {
+    use bitcoin::opcodes::all::{OP_ENDIF, OP_IF, OP_PUSHDATA1, OP_PUSHDATA2};
+    // Helpers to read pushdata opcodes minimally (immediate, PUSHDATA1, PUSHDATA2)
+    fn read_push(b: &[u8], p: &mut usize) -> Option<Vec<u8>> {
+        if *p >= b.len() {
+            return None;
+        }
+        let op = b[*p];
+        *p += 1;
+        let len = if op <= 75 {
+            op as usize
+        } else if op == OP_PUSHDATA1.to_u8() {
+            if *p + 1 > b.len() {
+                return None;
+            }
+            let l = b[*p] as usize;
+            *p += 1;
+            l
+        } else if op == OP_PUSHDATA2.to_u8() {
+            if *p + 2 > b.len() {
+                return None;
+            }
+            let l = (b[*p] as usize) | ((b[*p + 1] as usize) << 8);
+            *p += 2;
+            l
+        } else {
+            return None;
+        };
+        if *p + len > b.len() {
+            return None;
+        }
+        let out = b[*p..*p + len].to_vec();
+        *p += len;
+        Some(out)
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 2 < leaf_script.len() {
+        // Look for OP_FALSE (0x00) OP_IF pattern
+        if leaf_script[i] == 0x00 && leaf_script[i + 1] == OP_IF.to_u8() {
+            let mut p = i + 2;
+            // Expect "ord" magic
+            if let Some(magic) = read_push(leaf_script, &mut p) {
+                if magic.as_slice() == b"ord" {
+                    let mut content_type: Option<String> = None;
+                    let mut body: Option<Vec<u8>> = None;
+
+                    // Parse tag/value pushes until OP_ENDIF or end
+                    while p < leaf_script.len() {
+                        if leaf_script[p] == OP_ENDIF.to_u8() {
+                            p += 1;
+                            break;
+                        }
+                        let tag = match read_push(leaf_script, &mut p) {
+                            Some(v) => v,
+                            None => break,
+                        };
+                        let val = match read_push(leaf_script, &mut p) {
+                            Some(v) => v,
+                            None => break,
+                        };
+                        if tag.as_slice() == [1u8] {
+                            if let Ok(s) = String::from_utf8(val.clone()) {
+                                content_type = Some(s);
+                            }
+                        } else if tag.as_slice() == [2u8] {
+                            body = Some(val);
+                        }
+                    }
+
+                    if let Some(b) = body {
+                        let h = bitcoin::hashes::sha256::Hash::hash(&b);
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(h.as_byte_array());
+                        out.push((content_type, arr, b.len()));
+                    }
+
+                    i = p;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+fn extract_brc20_events_from_leaf(
+    leaf_script: &[u8],
+) -> Vec<(
+    usize,
+    String,
+    String,
+    Option<i16>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
+    use bitcoin::opcodes::all::{OP_ENDIF, OP_IF, OP_PUSHDATA1, OP_PUSHDATA2};
+
+    fn read_push(b: &[u8], p: &mut usize) -> Option<Vec<u8>> {
+        if *p >= b.len() {
+            return None;
+        }
+        let op = b[*p];
+        *p += 1;
+        let len = if op <= 75 {
+            op as usize
+        } else if op == OP_PUSHDATA1.to_u8() {
+            if *p + 1 > b.len() {
+                return None;
+            }
+            let l = b[*p] as usize;
+            *p += 1;
+            l
+        } else if op == OP_PUSHDATA2.to_u8() {
+            if *p + 2 > b.len() {
+                return None;
+            }
+            let l = (b[*p] as usize) | ((b[*p + 1] as usize) << 8);
+            *p += 2;
+            l
+        } else {
+            return None;
+        };
+        if *p + len > b.len() {
+            return None;
+        }
+        let out = b[*p..*p + len].to_vec();
+        *p += len;
+        Some(out)
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut inscription_idx = 0usize;
+    while i + 2 < leaf_script.len() {
+        if leaf_script[i] == 0x00 && leaf_script[i + 1] == OP_IF.to_u8() {
+            let mut p = i + 2;
+            if let Some(magic) = read_push(leaf_script, &mut p) {
+                if magic.as_slice() == b"ord" {
+                    let mut content_type: Option<String> = None;
+                    let mut body: Option<Vec<u8>> = None;
+
+                    while p < leaf_script.len() {
+                        if leaf_script[p] == OP_ENDIF.to_u8() {
+                            p += 1;
+                            break;
+                        }
+                        let tag = match read_push(leaf_script, &mut p) {
+                            Some(v) => v,
+                            None => break,
+                        };
+                        let val = match read_push(leaf_script, &mut p) {
+                            Some(v) => v,
+                            None => break,
+                        };
+                        if tag.as_slice() == [1u8] {
+                            if let Ok(s) = String::from_utf8(val.clone()) {
+                                content_type = Some(s);
+                            }
+                        } else if tag.as_slice() == [2u8] {
+                            body = Some(val);
+                        }
+                    }
+
+                    if let (Some(ct), Some(b)) = (content_type.clone(), body.clone()) {
+                        // Consider only JSON bodies for BRC-20
+                        let is_json_ct = ct.eq_ignore_ascii_case("application/json")
+                            || ct.eq_ignore_ascii_case("text/json")
+                            || ct.to_ascii_lowercase().starts_with("application/json;");
+                        if is_json_ct {
+                            if let Ok(json_val) =
+                                serde_json::from_slice::<serde_json::Value>(&b[..])
+                            {
+                                let get_str = |k: &str| -> Option<String> {
+                                    json_val
+                                        .get(k)
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
+                                };
+                                let get_i16 = |k: &str| -> Option<i16> {
+                                    if let Some(v) = json_val.get(k) {
+                                        if let Some(n) = v.as_i64() {
+                                            if n >= i16::MIN as i64 && n <= i16::MAX as i64 {
+                                                return Some(n as i16);
+                                            } else {
+                                                return None;
+                                            }
+                                        }
+                                        if let Some(s) = v.as_str() {
+                                            if let Ok(parsed) = s.parse::<i16>() {
+                                                return Some(parsed);
+                                            }
+                                        }
+                                    }
+                                    None
+                                };
+                                if let Some(pstr) = get_str("p") {
+                                    if pstr.eq_ignore_ascii_case("brc-20") {
+                                        if let Some(op) = get_str("op") {
+                                            let tick_raw = get_str("tick").unwrap_or_default();
+                                            let tick = tick_raw.trim().to_ascii_uppercase();
+                                            let decimals_raw = get_i16("decimals");
+                                            let decimals = decimals_raw.map(|d| {
+                                                if d < 0 {
+                                                    0
+                                                } else if d > 18 {
+                                                    18
+                                                } else {
+                                                    d
+                                                }
+                                            });
+                                            let amount_raw =
+                                                get_str("amt").map(|s| s.trim().to_string());
+                                            let limit_raw =
+                                                get_str("lim").map(|s| s.trim().to_string());
+                                            let max_supply_raw =
+                                                get_str("max").map(|s| s.trim().to_string());
+                                            let json_text_opt = String::from_utf8(b.clone()).ok();
+                                            let op_norm = op.trim().to_ascii_lowercase();
+                                            out.push((
+                                                inscription_idx,
+                                                op_norm,
+                                                tick,
+                                                decimals,
+                                                amount_raw,
+                                                limit_raw,
+                                                max_supply_raw,
+                                                json_text_opt,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    i = p;
+                    inscription_idx += 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn sql_escape(s: &str) -> String {
+    // Escape single quotes for SQL string literal safety
+    // This is sufficient for our batched VALUES strings; bytea and jsonb are handled via explicit casts.
+    s.replace('\'', "''")
+}
+
+// Concatenate runestone pushes after OP_13 into a single byte vector.
+// We accept small immediate pushes (<=75), PUSHDATA1, and PUSHDATA2.
+fn runestone_concat_pushes(payload: &[u8]) -> Option<Vec<u8>> {
+    use bitcoin::opcodes::all::{OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHNUM_13};
+
+    if payload.is_empty() || payload[0] != OP_PUSHNUM_13.to_u8() {
+        return None;
+    }
+    let mut i = 1usize;
+    let mut out = Vec::new();
+    while i < payload.len() {
+        let op = payload[i];
+        i += 1;
+        let len = if op <= 75 {
+            op as usize
+        } else if op == OP_PUSHDATA1.to_u8() {
+            if i + 1 > payload.len() {
+                return None;
+            }
+            let l = payload[i] as usize;
+            i += 1;
+            l
+        } else if op == OP_PUSHDATA2.to_u8() {
+            if i + 2 > payload.len() {
+                return None;
+            }
+            let l = (payload[i] as usize) | ((payload[i + 1] as usize) << 8);
+            i += 2;
+            l
+        } else {
+            // Unknown opcode in runestone; bail out
+            return None;
+        };
+        if i + len > payload.len() {
+            return None;
+        }
+        out.extend_from_slice(&payload[i..i + len]);
+        i += len;
+    }
+    Some(out)
+}
+
+// Decode a sequence of unsigned 128-bit LEB128 varints from `data`.
+// Continues until bytes are exhausted or a malformed varint is encountered.
+fn decode_varints128(mut data: &[u8]) -> Vec<u128> {
+    let mut out = Vec::new();
+    while !data.is_empty() {
+        let mut val: u128 = 0;
+        let mut shift: u32 = 0;
+        let mut consumed = 0usize;
+        for (idx, b) in data.iter().enumerate() {
+            let low = (b & 0x7F) as u128;
+            val |= low << shift;
+            consumed = idx + 1;
+            if (b & 0x80) == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 128 {
+                // overflow or malformed
+                consumed = idx + 1;
+                break;
+            }
+        }
+        if consumed == 0 {
+            break;
+        }
+        out.push(val);
+        data = &data[consumed..];
+    }
+    out
+}
+
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
@@ -86,6 +415,14 @@ use std::{
 };
 
 type BlockHeightSigned = i32;
+
+// Height hints (Bitcoin mainnet) to gate expensive parsing before features existed
+// These can be used to short-circuit Ordinals/BRC-20/Runes/Taproot/SegWit parsing for older blocks.
+pub const HINT_HEIGHT_SEGWIT: i32 = 481_824;
+pub const HINT_HEIGHT_TAPROOT: i32 = 709_632;
+pub const HINT_HEIGHT_ORDINALS: i32 = 767_430;
+pub const HINT_HEIGHT_BRC20: i32 = 779_832;
+pub const HINT_HEIGHT_RUNES: i32 = 840_000;
 
 /*
 /// Either `Connection` or `Transaction` for the code that needs to be generic over it
@@ -1320,10 +1657,16 @@ fn fmt_insert_blockdata_sql(
         &mut output_meta_q,
         "INSERT INTO output_meta(block_hash_id, tx_hash_id, tx_idx, spk_type, witness_version, witness_program_len, is_taproot, taproot_xonly_pubkey, op_return_payload) VALUES",
     );
+    // Runes events (append-only)
+    let mut runes_event_q = String::new();
+    let mut runes_event_fmt = MultiValueSqlFormatter::new_on_conflict_do_nothing(
+        &mut runes_event_q,
+        "INSERT INTO runes_event(block_hash_id, tx_hash_id, tx_idx, kind, seq, rune_name, rune_id, to_vout, amount_raw, divisibility, symbol, terms, pointer, raw) VALUES",
+    );
 
     if true {
         for block in blocks {
-            for tx in block.data.txdata.iter() {
+            for (tx_i, tx) in block.data.txdata.iter().enumerate() {
                 let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
                 for (vout, txout) in tx.output.iter().enumerate() {
                     // Script classification using Address::from_script (bitcoin 0.32)
@@ -1413,6 +1756,153 @@ fn fmt_insert_blockdata_sql(
                                 s.write_str(",'\\x").unwrap();
                                 write_hex(s, payload).unwrap();
                                 s.write_str("'::bytea)").unwrap();
+
+                                // Runes decode: detect runestone (OP_13) and decode concatenated pushes as base-128 varints
+                                if (block.height as i32) >= HINT_HEIGHT_RUNES
+                                    && !payload.is_empty()
+                                    && payload[0] == bitcoin::opcodes::all::OP_PUSHNUM_13.to_u8()
+                                {
+                                    if let Some(concat) = runestone_concat_pushes(&payload[..]) {
+                                        let ints = decode_varints128(&concat[..]);
+
+                                        // If we see tag 4 (name_numeral), treat as an etching
+                                        let has_name_tag = ints.windows(2).any(|w| w.len() == 2 && w[0] == 4);
+                                        if !ints.is_empty() && has_name_tag {
+                                            let etching = crate::util::runes::parse_etching_from_varints(&ints[..]);
+                                            let terms_obj = serde_json::json!({
+                                                "name_numeral": etching.name_numeral.map(|v| v.to_string()),
+                                                "premine": etching.premine,
+                                                "mint_amount": etching.mint_amount,
+                                                "mint_cap": etching.mint_cap,
+                                                "start_height": etching.start_height,
+                                                "end_height": etching.end_height,
+                                                "extra_terms": etching.extra_terms,
+                                            });
+                                            let terms_str = terms_obj.to_string();
+                                            let rune_id_str = format!("{}:{}", block.height, tx_i);
+
+                                            runes_event_fmt.fmt_with(|rs| {
+                                                // block_hash_id
+                                                rs.write_str("('\\x").unwrap();
+                                                write_hash_id_hex(rs, block.id.as_raw_hash()).unwrap();
+                                                // tx_hash_id
+                                                rs.write_str("'::bytea,'\\x").unwrap();
+                                                write_hash_id_hex(rs, tx_id.as_raw_hash()).unwrap();
+                                                // tx_idx (vout)
+                                                rs.write_fmt(format_args!("'::bytea,{}", vout)).unwrap();
+                                                // kind, seq
+                                                rs.write_str(",'etching',0").unwrap();
+                                                // rune_name
+                                                if let Some(ref name) = etching.name_decoded {
+                                                    rs.write_str(",'").unwrap();
+                                                    rs.write_str(name).unwrap();
+                                                    rs.write_str("'").unwrap();
+                                                } else {
+                                                    rs.write_str(",NULL").unwrap();
+                                                }
+                                                // rune_id
+                                                rs.write_str(",'").unwrap();
+                                                rs.write_str(&rune_id_str).unwrap();
+                                                rs.write_str("'").unwrap();
+                                                // to_vout
+                                                rs.write_str(",NULL").unwrap();
+                                                // amount_raw
+                                                rs.write_str(",NULL").unwrap();
+                                                // divisibility
+                                                if let Some(d) = etching.divisibility {
+                                                    rs.write_fmt(format_args!(",{}", d)).unwrap();
+                                                } else {
+                                                    rs.write_str(",NULL").unwrap();
+                                                }
+                                                // symbol
+                                                if let Some(sym) = etching.symbol {
+                                                    rs.write_str(",'").unwrap();
+                                                    rs.write_str(&sym.to_string()).unwrap();
+                                                    rs.write_str("'").unwrap();
+                                                } else {
+                                                    rs.write_str(",NULL").unwrap();
+                                                }
+                                                // terms
+                                                rs.write_str(",'").unwrap();
+                                                rs.write_str(&sql_escape(&terms_str)).unwrap();
+                                                rs.write_str("'::jsonb").unwrap();
+                                                // pointer
+                                                rs.write_str(",NULL").unwrap();
+                                                // raw
+                                                rs.write_str(",'\\x").unwrap();
+                                                write_hex(rs, &payload[..]).unwrap();
+                                                rs.write_str("'::bytea)").unwrap();
+                                            });
+                                        } else if ints.is_empty() {
+                                            // Raw runestone fallback
+                                            runes_event_fmt.fmt_with(|rs| {
+                                                rs.write_str("('\\x").unwrap();
+                                                write_hash_id_hex(rs, block.id.as_raw_hash()).unwrap();
+                                                rs.write_str("'::bytea,'\\x").unwrap();
+                                                write_hash_id_hex(rs, tx_id.as_raw_hash()).unwrap();
+                                                rs.write_fmt(format_args!("'::bytea,{}", vout)).unwrap();
+                                                rs.write_str(",'runestone',0,NULL,NULL,NULL,NULL,NULL,NULL").unwrap();
+                                                rs.write_str(",'\\x").unwrap();
+                                                write_hex(rs, &payload[..]).unwrap();
+                                                rs.write_str("'::bytea)").unwrap();
+                                            });
+                                        } else {
+                                            // Decode edicts using ordinals Runestone::decipher and emit structured rows (no heuristics)
+                                                                                        if let Some(artifact) = ordinals::Runestone::decipher(tx) {
+                                                                                            if let ordinals::Artifact::Runestone(rs) = artifact {
+                                                                                                let pointer_opt: Option<i32> = rs.pointer.map(|p| p as i32);
+                                                                                                for (seq, ed) in rs.edicts.iter().enumerate() {
+                                                                                                    let rune_id_str = format!("{}:{}", ed.id.block, ed.id.tx);
+                                                                                                    let amount_str = ed.amount.to_string();
+                                                                                                    let to_vout = ed.output as usize;
+
+                                                                                                    runes_event_fmt.fmt_with(|rsql| {
+                                                                                                        // block_hash_id
+                                                                                                        rsql.write_str("('\\x").unwrap();
+                                                                                                        write_hash_id_hex(rsql, block.id.as_raw_hash()).unwrap();
+                                                                                                        // tx_hash_id
+                                                                                                        rsql.write_str("'::bytea,'\\x").unwrap();
+                                                                                                        write_hash_id_hex(rsql, tx_id.as_raw_hash()).unwrap();
+                                                                                                        // tx_idx (use edict output index)
+                                                                                                        rsql.write_fmt(format_args!("'::bytea,{}", to_vout)).unwrap();
+                                                                                                        // kind, seq
+                                                                                                        rsql.write_str(",'edict',").unwrap();
+                                                                                                        rsql.write_fmt(format_args!("{}", seq)).unwrap();
+                                                                                                        // rune_name
+                                                                                                        rsql.write_str(",NULL").unwrap();
+                                                                                                        // rune_id
+                                                                                                        rsql.write_str(",'").unwrap();
+                                                                                                        rsql.write_str(&rune_id_str).unwrap();
+                                                                                                        rsql.write_str("'").unwrap();
+                                                                                                        // to_vout (explicit)
+                                                                                                        rsql.write_fmt(format_args!(",{}", to_vout)).unwrap();
+                                                                                                        // amount_raw
+                                                                                                        rsql.write_str(",'").unwrap();
+                                                                                                        rsql.write_str(&amount_str).unwrap();
+                                                                                                        rsql.write_str("'").unwrap();
+                                                                                                        // divisibility
+                                                                                                        rsql.write_str(",NULL").unwrap();
+                                                                                                        // symbol
+                                                                                                        rsql.write_str(",NULL").unwrap();
+                                                                                                        // terms
+                                                                                                        rsql.write_str(",NULL").unwrap();
+                                                                                                        // pointer
+                                                                                                        if let Some(p) = pointer_opt {
+                                                                                                            rsql.write_fmt(format_args!(",{}", p)).unwrap();
+                                                                                                        } else {
+                                                                                                            rsql.write_str(",NULL").unwrap();
+                                                                                                        }
+                                                                                                        // raw (store original OP_RETURN tail)
+                                                                                                        rsql.write_str(",'\\x").unwrap();
+                                                                                                        write_hex(rsql, &payload[..]).unwrap();
+                                                                                                        rsql.write_str("'::bytea)").unwrap();
+                                                                                                    });
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                        }
+                                    }
+                                }
                             } else {
                                 // Not an OP_RETURN spk; no payload
                                 s.write_str(",NULL)").unwrap();
@@ -1446,6 +1936,20 @@ fn fmt_insert_blockdata_sql(
             "INSERT INTO input_reveals(block_hash_id, tx_hash_id, input_idx, output_tx_hash_id, output_tx_idx, redeem_script_id, witness_script_id, taproot_leaf_script_id, taproot_control_block, annex_present, sighash_flags, is_taproot_key_spend, schnorr_sig_count) VALUES",
         );
 
+    // Ordinals inscriptions (append-only)
+    let mut inscription_q = String::new();
+    let mut inscription_fmt = MultiValueSqlFormatter::new_on_conflict_do_nothing(
+            &mut inscription_q,
+            "INSERT INTO inscription(block_hash_id, tx_hash_id, input_idx, inscription_idx, taproot_leaf_script_id, content_type, body_sha256, body_size, parser_version) VALUES",
+        );
+
+    // BRC-20 events derived from inscriptions (append-only)
+    let mut brc20_event_q = String::new();
+    let mut brc20_event_fmt = MultiValueSqlFormatter::new_on_conflict_do_nothing(
+            &mut brc20_event_q,
+            "INSERT INTO brc20_event(block_hash_id, tx_hash_id, input_idx, inscription_idx, op, tick, decimals, amount_raw, limit_raw, max_supply_raw, json) VALUES",
+        );
+
     // Miniscript parsing counters (batch-level)
     let mut ms_legacy: usize = 0;
     let mut ms_segwitv0: usize = 0;
@@ -1454,7 +1958,7 @@ fn fmt_insert_blockdata_sql(
 
     if true {
         for block in blocks {
-            for tx in block.data.txdata.iter() {
+            for (_tx_i, tx) in block.data.txdata.iter().enumerate() {
                 let tx_id = calculate_tx_id_with_workarounds(block, tx, network);
                 if tx.is_coinbase() {
                     // Skip coinbase: previous_output is invalid (vout can be 0xffffffff)
@@ -1760,16 +2264,30 @@ fn fmt_insert_blockdata_sql(
                         } else {
                             s.write_str(",NULL").unwrap();
                         }
-                        // witness_script_id
-                        if let Some(ref hbytes) = script_hash_bytes {
-                            s.write_str(",'\\x").unwrap();
-                            s.write_str(&hex::encode(&hbytes[..])).unwrap();
-                            s.write_str("'::bytea").unwrap();
+                        // witness_script_id (segwit v0 only)
+                        if taproot_control_opt.is_none() {
+                            if let Some(ref hbytes) = script_hash_bytes {
+                                s.write_str(",'\\x").unwrap();
+                                s.write_str(&hex::encode(&hbytes[..])).unwrap();
+                                s.write_str("'::bytea").unwrap();
+                            } else {
+                                s.write_str(",NULL").unwrap();
+                            }
                         } else {
                             s.write_str(",NULL").unwrap();
                         }
-                        // taproot_leaf_script_id
-                        s.write_str(",NULL").unwrap();
+                        // taproot_leaf_script_id (taproot script-path only)
+                        if taproot_control_opt.is_some() {
+                            if let Some(ref hbytes) = script_hash_bytes {
+                                s.write_str(",'\\x").unwrap();
+                                s.write_str(&hex::encode(&hbytes[..])).unwrap();
+                                s.write_str("'::bytea").unwrap();
+                            } else {
+                                s.write_str(",NULL").unwrap();
+                            }
+                        } else {
+                            s.write_str(",NULL").unwrap();
+                        }
                         // taproot_control_block
                         if let Some(ref ctrl) = taproot_control_opt {
                             s.write_str(",'\\x").unwrap();
@@ -1806,6 +2324,134 @@ fn fmt_insert_blockdata_sql(
                         } else {
                             s.write_str(",NULL)").unwrap();
                         }
+
+                        // Append inscriptions parsed from taproot leaf script (inline)
+                        if taproot_control_opt.is_some()
+                            && (block.height as i32) >= HINT_HEIGHT_ORDINALS
+                        {
+                            // BRC-20 extraction (height-gated)
+                            if (block.height as i32) >= HINT_HEIGHT_BRC20 {
+                                if let (Some(_hbytes), Some(ref script_bytes)) =
+                                    (script_hash_bytes.as_ref(), script_bytes_opt.as_ref())
+                                {
+                                    let brc_events =
+                                        extract_brc20_events_from_leaf(&script_bytes[..]);
+                                    for (
+                                        insc_idx,
+                                        op,
+                                        tick,
+                                        decimals,
+                                        amount_raw,
+                                        limit_raw,
+                                        max_supply_raw,
+                                        json_text,
+                                    ) in brc_events
+                                    {
+                                        brc20_event_fmt.fmt_with(|be| {
+                                            // block_hash_id
+                                            be.write_str("('\\x").unwrap();
+                                            write_hash_id_hex(be, block.id.as_raw_hash()).unwrap();
+                                            // tx_hash_id
+                                            be.write_str("'::bytea,'\\x").unwrap();
+                                            write_hash_id_hex(be, tx_id.as_raw_hash()).unwrap();
+                                            // input_idx
+                                            be.write_fmt(format_args!("'::bytea,{}", iidx))
+                                                .unwrap();
+                                            // inscription_idx
+                                            be.write_fmt(format_args!(",{}", insc_idx)).unwrap();
+                                            // op
+                                            be.write_str(",'").unwrap();
+                                            be.write_str(&op).unwrap();
+                                            be.write_str("'").unwrap();
+                                            // tick
+                                            be.write_str(",'").unwrap();
+                                            be.write_str(&tick).unwrap();
+                                            be.write_str("'").unwrap();
+                                            // decimals
+                                            if let Some(d) = decimals {
+                                                be.write_fmt(format_args!(",{}", d)).unwrap();
+                                            } else {
+                                                be.write_str(",NULL").unwrap();
+                                            }
+                                            // amount_raw
+                                            if let Some(ref a) = amount_raw {
+                                                be.write_str(",'").unwrap();
+                                                be.write_str(a).unwrap();
+                                                be.write_str("'").unwrap();
+                                            } else {
+                                                be.write_str(",NULL").unwrap();
+                                            }
+                                            // limit_raw
+                                            if let Some(ref l) = limit_raw {
+                                                be.write_str(",'").unwrap();
+                                                be.write_str(l).unwrap();
+                                                be.write_str("'").unwrap();
+                                            } else {
+                                                be.write_str(",NULL").unwrap();
+                                            }
+                                            // max_supply_raw
+                                            if let Some(ref m) = max_supply_raw {
+                                                be.write_str(",'").unwrap();
+                                                be.write_str(m).unwrap();
+                                                be.write_str("'").unwrap();
+                                            } else {
+                                                be.write_str(",NULL").unwrap();
+                                            }
+                                            // json (store full JSON as JSONB)
+                                            if let Some(ref j) = json_text {
+                                                be.write_str(",'").unwrap();
+                                                be.write_str(&sql_escape(j)).unwrap();
+                                                be.write_str("'::jsonb)").unwrap();
+                                            } else {
+                                                be.write_str(",NULL)").unwrap();
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                            // Ordinals inscriptions
+                            if let (Some(ref hbytes), Some(ref script_bytes)) =
+                                (script_hash_bytes.as_ref(), script_bytes_opt.as_ref())
+                            {
+                                let inscriptions = parse_ordinals_inscriptions(&script_bytes[..]);
+                                for (insc_idx, (ct_opt, body_sha, body_len)) in
+                                    inscriptions.into_iter().enumerate()
+                                {
+                                    inscription_fmt.fmt_with(|ss| {
+                                        // block_hash_id
+                                        ss.write_str("('\\x").unwrap();
+                                        write_hash_id_hex(ss, block.id.as_raw_hash()).unwrap();
+                                        // tx_hash_id
+                                        ss.write_str("'::bytea,'\\x").unwrap();
+                                        write_hash_id_hex(ss, tx_id.as_raw_hash()).unwrap();
+                                        // input_idx
+                                        ss.write_fmt(format_args!("'::bytea,{}", iidx)).unwrap();
+                                        // inscription_idx
+                                        ss.write_fmt(format_args!(",{}", insc_idx)).unwrap();
+                                        // taproot_leaf_script_id
+                                        ss.write_str(",'\\x").unwrap();
+                                        ss.write_str(&hex::encode(&hbytes[..])).unwrap();
+                                        ss.write_str("'::bytea").unwrap();
+                                        // content_type
+                                        if let Some(ref ct) = ct_opt {
+                                            ss.write_str(",'").unwrap();
+                                            ss.write_str(ct).unwrap();
+                                            ss.write_str("'").unwrap();
+                                        } else {
+                                            ss.write_str(",NULL").unwrap();
+                                        }
+                                        // body_sha256
+                                        ss.write_str(",'\\x").unwrap();
+                                        ss.write_str(&hex::encode(&body_sha[..])).unwrap();
+                                        ss.write_str("'::bytea").unwrap();
+                                        // body_size
+                                        ss.write_fmt(format_args!(",{}", body_len)).unwrap();
+                                        // parser_version
+                                        ss.write_str(",1)").unwrap();
+                                    });
+                                }
+                            }
+                        }
                     });
                 }
             }
@@ -1814,6 +2460,9 @@ fn fmt_insert_blockdata_sql(
     drop(script_fmt);
     drop(input_reveals_fmt);
     drop(script_features_fmt);
+    drop(inscription_fmt);
+    drop(brc20_event_fmt);
+    drop(runes_event_fmt);
 
     // Miniscript batch counters summary
     let total_ms = ms_legacy + ms_segwitv0 + ms_tap + ms_fail;
@@ -1837,6 +2486,15 @@ fn fmt_insert_blockdata_sql(
         }
         if !input_reveals_q.is_empty() {
             v.push(input_reveals_q);
+        }
+        if !inscription_q.is_empty() {
+            v.push(inscription_q);
+        }
+        if !brc20_event_q.is_empty() {
+            v.push(brc20_event_q);
+        }
+        if !runes_event_q.is_empty() {
+            v.push(runes_event_q);
         }
         Ok(v)
     }

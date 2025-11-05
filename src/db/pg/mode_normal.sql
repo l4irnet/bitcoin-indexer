@@ -1,5 +1,126 @@
 -- Add FKs and indices for new append-only tables in normal mode
 
+-- FKs for inscription
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_inscription_block_hash_id') THEN
+    ALTER TABLE inscription
+    ADD CONSTRAINT fk_inscription_block_hash_id FOREIGN KEY (block_hash_id)
+      REFERENCES block(hash_id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_inscription_tx_hash_id') THEN
+    ALTER TABLE inscription
+    ADD CONSTRAINT fk_inscription_tx_hash_id FOREIGN KEY (tx_hash_id)
+      REFERENCES tx(hash_id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_inscription_taproot_leaf_script_id') THEN
+    ALTER TABLE inscription
+    ADD CONSTRAINT fk_inscription_taproot_leaf_script_id FOREIGN KEY (taproot_leaf_script_id)
+      REFERENCES script(id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+-- FKs for brc20_event
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_brc20_event_block_hash_id') THEN
+    ALTER TABLE brc20_event
+    ADD CONSTRAINT fk_brc20_event_block_hash_id FOREIGN KEY (block_hash_id)
+      REFERENCES block(hash_id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_brc20_event_tx_hash_id') THEN
+    ALTER TABLE brc20_event
+    ADD CONSTRAINT fk_brc20_event_tx_hash_id FOREIGN KEY (tx_hash_id)
+      REFERENCES tx(hash_id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+-- FKs for runes_event
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_runes_event_block_hash_id') THEN
+    ALTER TABLE runes_event
+    ADD CONSTRAINT fk_runes_event_block_hash_id FOREIGN KEY (block_hash_id)
+      REFERENCES block(hash_id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_runes_event_tx_hash_id') THEN
+    ALTER TABLE runes_event
+    ADD CONSTRAINT fk_runes_event_tx_hash_id FOREIGN KEY (tx_hash_id)
+      REFERENCES tx(hash_id)
+      ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END;
+$$;
+
+-- Indices for new tables
+CREATE INDEX IF NOT EXISTS inscription_content_type ON inscription (content_type);
+CREATE INDEX IF NOT EXISTS inscription_leaf_script_id ON inscription (taproot_leaf_script_id);
+
+CREATE INDEX IF NOT EXISTS brc20_event_tick ON brc20_event (tick);
+CREATE INDEX IF NOT EXISTS brc20_event_op ON brc20_event (op);
+
+CREATE INDEX IF NOT EXISTS runes_event_kind ON runes_event (kind);
+CREATE INDEX IF NOT EXISTS runes_event_rune_name ON runes_event (rune_name);
+CREATE INDEX IF NOT EXISTS runes_event_rune_id ON runes_event (rune_id);
+CREATE INDEX IF NOT EXISTS runes_event_pointer ON runes_event (pointer);
+
+-- Convenience views
+CREATE OR REPLACE VIEW inscription_with_block AS
+  SELECT
+    ins.*,
+    b.height AS block_height
+  FROM inscription AS ins
+  JOIN block AS b ON b.hash_id = ins.block_hash_id AND b.extinct = false;
+
+CREATE OR REPLACE VIEW brc20_event_with_block AS
+  SELECT
+    e.*,
+    b.height AS block_height
+  FROM brc20_event AS e
+  JOIN block AS b ON b.hash_id = e.block_hash_id AND b.extinct = false;
+
+CREATE OR REPLACE VIEW runes_event_with_block AS
+  SELECT
+    re.*,
+    b.height AS block_height
+  FROM runes_event AS re
+  JOIN block AS b ON b.hash_id = re.block_hash_id AND b.extinct = false;
+
 -- Ergonomic views: outputs joined with output_meta via non-extinct blocks
 CREATE OR REPLACE VIEW output_with_meta AS
   SELECT
